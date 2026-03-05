@@ -2,15 +2,15 @@ package net.runelite.client.plugins.microbot.templetrekking;
 
 import lombok.Getter;
 import lombok.extern.slf4j.Slf4j;
+import net.runelite.api.coords.WorldPoint;
 import net.runelite.client.plugins.microbot.Microbot;
 import net.runelite.client.plugins.microbot.Script;
+import net.runelite.client.plugins.microbot.api.tileobject.models.Rs2TileObjectModel;
+import net.runelite.client.plugins.microbot.api.npc.models.Rs2NpcModel;
 import net.runelite.client.plugins.microbot.util.dialogues.Rs2Dialogue;
 import net.runelite.client.plugins.microbot.util.inventory.Rs2Inventory;
-import net.runelite.client.plugins.microbot.util.npc.Rs2Npc;
-import net.runelite.client.plugins.microbot.util.npc.Rs2NpcModel;
 import net.runelite.client.plugins.microbot.util.player.Rs2Player;
 import net.runelite.client.plugins.microbot.util.walker.Rs2Walker;
-import net.runelite.api.coords.WorldPoint;
 
 import java.time.Instant;
 import java.util.concurrent.TimeUnit;
@@ -19,104 +19,99 @@ import static net.runelite.client.plugins.microbot.util.Global.sleep;
 import static net.runelite.client.plugins.microbot.util.Global.sleepUntil;
 
 /**
- * TempleTrekkingScript is the brain of the plugin.
+ * TempleTrekkingScript — the full state machine for automating Temple Trekking.
  *
- * It extends Script, which gives us:
- *  - scheduledExecutorService   (a background thread pool)
- *  - mainScheduledFuture        (a handle to our running loop so we can cancel it)
- *  - super.run()                (checks global pause/stop flags before each tick)
- *  - shutdown()                 (cancels the loop cleanly)
- *  - sleep() / sleepUntil()     (safe to use here — we're on a background thread, not the client thread)
+ * KEY CONCEPTS FOR LEARNING:
  *
- * The core pattern: scheduleWithFixedDelay runs our logic every 600ms (1 game tick).
- * Each tick, we look at currentState and call the matching handler method.
- * Each handler either does work or transitions to the next state.
+ * 1. STATE MACHINE: The bot is always in exactly one state. Each tick, the switch
+ *    statement calls the handler for that state. Handlers either do work or change
+ *    the state. This makes complex multi-step logic easy to reason about.
+ *
+ * 2. NEW API vs OLD API:
+ *    Old (deprecated): Rs2Npc.getNpc("Name")  /  Rs2Npc.interact(npc, "action")
+ *    New (use this):   Microbot.getRs2NpcCache().query().withName("Name").nearest()
+ *                      npc.click("action")
+ *    Same pattern applies to objects: Microbot.getRs2TileObjectCache().query()...
+ *
+ * 3. NULL CHECKS: Game objects can disappear between ticks. Always null-check
+ *    before using a result from a query.
+ *
+ * 4. sleepUntil(): Pauses until a condition is true OR a timeout expires.
+ *    Returns true if condition was met, false if it timed out.
+ *    Only safe to call from our background thread — never from the client thread.
  */
-@Slf4j  // Lombok: gives us log.info(), log.warn(), log.error() for free
+@Slf4j
 public class TempleTrekkingScript extends Script {
 
-    // -------------------------------------------------------------------------
-    // Constants — NPC names and WorldPoints we'll need
-    // -------------------------------------------------------------------------
+    // =========================================================================
+    // NPC IDs — verified in-game
+    // Using IDs is more reliable than names because names can change with
+    // game updates, but IDs are stable.
+    // =========================================================================
 
-    /**
-     * The easy escort NPCs available at the Burgh de Rott Ramble start (Paterdomus side).
-     * We look for any one of these when starting a new trek.
-     *
-     * "Adventurer" and "Mage" are the easy-class followers on the Ramble side.
-     * Exact names as they appear in-game (right-click the NPC to confirm).
-     */
-    private static final String[] EASY_RAMBLE_NPCS = {
-        "Adventurer",
-        "Mage"
-    };
+    // Burgh de Rott side (Temple Trekking start) — easy followers
+    private static final int NPC_FYIONA_FRAY   = 1567;
+    private static final int NPC_DALCIAN_FANG  = 1566;
 
-    /**
-     * The easy escort NPCs available at the Temple Trekking start (Burgh de Rott side).
-     */
-    private static final String[] EASY_TREK_NPCS = {
-        "Fyiona Fray",
-        "Dalcian Fang"
-    };
+    // Paterdomus side (Burgh de Rott Ramble start) — easy followers
+    private static final int NPC_ADVENTURER    = 1577;
+    private static final int NPC_MAGE          = 1578;
 
-    /**
-     * WorldPoint for the Burgh de Rott Ramble start area (east of Paterdomus, River Salve crossing).
-     * We walk here before looking for an escort NPC.
-     *
-     * NOTE: You will need to verify these coordinates in-game using the
-     * "Tile Location" plugin in RuneLite (turn it on in the plugin hub,
-     * then hover your mouse over the NPC area to see the WorldPoint).
-     * These are approximate — adjust once you confirm in-game.
-     */
+    // =========================================================================
+    // Item IDs — verified in-game
+    // =========================================================================
+
+    private static final int ITEM_SHORT_VINE   = 7778;  // Cut from swamp trees (need 3)
+    private static final int ITEM_LONG_VINE    = 7777;  // Combined from short vines
+    private static final int ITEM_LOG          = 1511;  // Chopped from dead trees
+    private static final int ITEM_PLANK        = 960;   // Looted from Undead Lumberjacks
+
+    // =========================================================================
+    // Object names used in queries
+    // We query by name because Temple Trekking uses instanced areas where
+    // object IDs may vary. Names are consistent within the minigame.
+    // =========================================================================
+
+    // Path stones that advance the trek
+    private static final String OBJ_CONTINUE_PATH  = "Path";       // Blue stones: "Continue-trek"
+    private static final String OBJ_EVADE_PATH      = "Path";       // Same object type, different option
+
+    // Bridge event objects
+    private static final String OBJ_BROKEN_BRIDGE         = "Broken bridge";
+    private static final String OBJ_PARTIALLY_BROKEN      = "Partially broken bridge";
+    private static final String OBJ_SLIGHTLY_BROKEN       = "Slightly broken bridge";
+    private static final String OBJ_FIXED_BRIDGE          = "Fixed bridge";
+    private static final String OBJ_DEAD_TREE             = "Dead tree";
+
+    // River event objects
+    private static final String OBJ_SWAMP_TREE            = "Swamp tree";    // Has "Cut-vine" option
+    private static final String OBJ_SWAMP_TREE_BRANCH     = "Swamp tree branch"; // Throw/swing
+
+    // =========================================================================
+    // Start locations — approximate WorldPoints for walking to start area.
+    // NOTE: Verify these in-game with RuneLite's Tile Location plugin.
+    // =========================================================================
     private static final WorldPoint RAMBLE_START_LOCATION = new WorldPoint(3408, 3479, 0);
+    private static final WorldPoint TREK_START_LOCATION   = new WorldPoint(3494, 3215, 0);
 
-    /**
-     * WorldPoint for the Temple Trekking start area (Burgh de Rott).
-     * Same note — confirm in-game.
-     */
-    private static final WorldPoint TREK_START_LOCATION = new WorldPoint(3494, 3215, 0);
+    // =========================================================================
+    // State tracking (exposed to overlay via @Getter)
+    // =========================================================================
 
-    // -------------------------------------------------------------------------
-    // State tracking
-    // -------------------------------------------------------------------------
+    @Getter private TempleTrekkingState currentState = TempleTrekkingState.IDLE;
+    @Getter private int trekCount = 0;
+    @Getter private Instant startTime;
 
-    /**
-     * @Getter (from Lombok) auto-generates a getCurrentState() method.
-     * The overlay uses this to display the current state.
-     */
-    @Getter
-    private TempleTrekkingState currentState = TempleTrekkingState.IDLE;
-
-    /**
-     * Counts how many full treks have completed this session.
-     * Shown on the overlay.
-     */
-    @Getter
-    private int trekCount = 0;
-
-    /**
-     * The moment run() was called. Used to calculate the runtime shown on the overlay.
-     */
-    @Getter
-    private Instant startTime;
-
-    /**
-     * Holds a reference to the config so we know which direction to run,
-     * and which events to complete vs skip.
-     */
     private TempleTrekkingConfig config;
 
-    // -------------------------------------------------------------------------
-    // Entry point
-    // -------------------------------------------------------------------------
+    // Tracks how many logs/planks we've used to repair the current bridge
+    // so we know when the bridge is fully fixed.
+    private int bridgeMaterialsUsed = 0;
 
-    /**
-     * Called by TempleTrekkingPlugin.startUp().
-     * Saves the config, records start time, and kicks off the scheduled loop.
-     *
-     * @param config The user's settings from the RuneLite config panel.
-     * @return true if the script started successfully.
-     */
+    // =========================================================================
+    // Entry point
+    // =========================================================================
+
     public boolean run(TempleTrekkingConfig config) {
         this.config = config;
         this.startTime = Instant.now();
@@ -124,81 +119,27 @@ public class TempleTrekkingScript extends Script {
 
         log.info("Temple Trekking script starting. Direction: {}", config.trekDirection());
 
-        /**
-         * scheduleWithFixedDelay(task, initialDelay, period, unit)
-         *
-         * This runs our lambda every 600ms (one game tick).
-         * "Fixed delay" means: wait 600ms AFTER the previous run finishes,
-         * so if our logic takes 200ms, the next run starts 600ms later.
-         * This prevents pile-up if a tick takes longer than expected.
-         */
         mainScheduledFuture = scheduledExecutorService.scheduleWithFixedDelay(() -> {
             try {
-                // super.run() returns false if the user has paused all scripts
-                // or if the script has been shut down. Always check this first.
                 if (!super.run()) return;
-
-                // Don't do anything if we're not logged in
                 if (!Microbot.isLoggedIn()) return;
 
-                // Route execution to the correct handler based on current state
                 switch (currentState) {
-                    case IDLE:
-                        // Waiting — do nothing until something sets a real state
-                        break;
-
-                    case START_TREK:
-                        handleStartTrek();
-                        break;
-
-                    case SELECT_ROUTE:
-                        handleSelectRoute();
-                        break;
-
-                    case TREKKING:
-                        handleTrekking();
-                        break;
-
-                    case DETECT_EVENT:
-                        handleDetectEvent();
-                        break;
-
-                    case EVADE_COMBAT:
-                        handleEvadeCombat();
-                        break;
-
-                    case BRIDGE_CHOP_TREES:
-                        handleBridgeChopTrees();
-                        break;
-
-                    case BRIDGE_KILL_ZOMBIES:
-                        handleBridgeKillZombies();
-                        break;
-
-                    case RIVER_CROSSING:
-                        handleRiverCrossing();
-                        break;
-
-                    case CONTINUE_TREK:
-                        handleContinueTrek();
-                        break;
-
-                    case TREK_COMPLETE:
-                        handleTrekComplete();
-                        break;
-
-                    case UNKNOWN_EVENT:
-                        handleUnknownEvent();
-                        break;
-
-                    default:
-                        log.warn("Unhandled state: {}", currentState);
-                        break;
+                    case IDLE:               break;
+                    case START_TREK:         handleStartTrek();        break;
+                    case SELECT_ROUTE:       handleSelectRoute();      break;
+                    case TREKKING:           handleTrekking();         break;
+                    case DETECT_EVENT:       handleDetectEvent();      break;
+                    case EVADE_COMBAT:       handleEvadeCombat();      break;
+                    case BRIDGE_CHOP_TREES:  handleBridgeChopTrees();  break;
+                    case BRIDGE_KILL_ZOMBIES:handleBridgeKillZombies();break;
+                    case RIVER_CROSSING:     handleRiverCrossing();    break;
+                    case CONTINUE_TREK:      handleContinueTrek();     break;
+                    case TREK_COMPLETE:      handleTrekComplete();     break;
+                    case UNKNOWN_EVENT:      handleUnknownEvent();     break;
+                    default: log.warn("Unhandled state: {}", currentState); break;
                 }
-
             } catch (Exception e) {
-                // Never let an exception crash the background thread.
-                // Log it and keep running — the next tick will try again.
                 log.error("Error in Temple Trekking script loop: ", e);
             }
         }, 0, 600, TimeUnit.MILLISECONDS);
@@ -206,293 +147,545 @@ public class TempleTrekkingScript extends Script {
         return true;
     }
 
-    // -------------------------------------------------------------------------
-    // State handlers — one method per state
-    // Each method does one small piece of work, then either:
-    //   a) Does nothing (waits for a condition to be true next tick)
-    //   b) Transitions to the next state with setState()
-    // -------------------------------------------------------------------------
-
-    /**
-     * STATE: START_TREK
-     *
-     * Goal: Find an easy escort NPC and start talking to them.
-     *
-     * Steps:
-     * 1. Walk to the start location if we're not already there.
-     * 2. Find any easy escort NPC nearby.
-     * 3. Talk to them (this opens a dialogue).
-     * 4. Transition to SELECT_ROUTE.
-     */
+    // =========================================================================
+    // STATE: START_TREK
+    //
+    // Find an easy escort NPC and right-click "Escort" to start immediately
+    // without going through dialogue, then wait for SELECT_ROUTE dialogue.
+    // =========================================================================
     private void handleStartTrek() {
-        log.info("Looking for escort NPC to start trek...");
-
-        // Figure out which NPC names and location to use based on config
-        String[] npcNames = config.trekDirection() == TempleTrekkingConfig.TrekDirection.BURGH_DE_ROTT_RAMBLE
-                ? EASY_RAMBLE_NPCS
-                : EASY_TREK_NPCS;
+        // Pick which NPC IDs and start location to use based on direction config
+        int[] npcIds = config.trekDirection() == TempleTrekkingConfig.TrekDirection.BURGH_DE_ROTT_RAMBLE
+                ? new int[]{NPC_ADVENTURER, NPC_MAGE}
+                : new int[]{NPC_FYIONA_FRAY, NPC_DALCIAN_FANG};
 
         WorldPoint startLocation = config.trekDirection() == TempleTrekkingConfig.TrekDirection.BURGH_DE_ROTT_RAMBLE
                 ? RAMBLE_START_LOCATION
                 : TREK_START_LOCATION;
 
-        // Try to find any of the easy NPCs nearby
-        Rs2NpcModel escortNpc = findEscortNpc(npcNames);
+        // Query the NPC cache for the nearest escort NPC matching any of our IDs.
+        // withIds() accepts varargs — matches any NPC whose ID is in the array.
+        Rs2NpcModel escortNpc = Microbot.getRs2NpcCache().query()
+                .withIds(npcIds)
+                .nearest();
 
         if (escortNpc == null) {
-            // NPC not visible — walk toward the start area so they come into render distance
-            log.info("Escort NPC not found, walking to start location...");
+            // Not visible yet — walk toward the start area to load them in
+            log.info("Escort NPC not found nearby, walking to start area...");
             Rs2Walker.walkTo(startLocation);
-            // Don't transition yet — next tick we'll check again after walking
-            return;
+            return; // Check again next tick after walking
         }
 
-        // Found an NPC — talk to them
-        log.info("Found escort NPC: {}. Talking...", escortNpc.getName());
-        boolean talked = Rs2Npc.interact(escortNpc, "Escort");
+        log.info("Found escort NPC: {} (id={}). Clicking Escort...", escortNpc.getName(), escortNpc.getId());
 
-        if (talked) {
-            // Wait for the dialogue to open (up to 5 seconds)
+        // click("Escort") uses the right-click "Escort" option directly,
+        // which skips most of the dialogue and goes straight to route selection.
+        boolean clicked = escortNpc.click("Escort");
+
+        if (clicked) {
+            // Wait up to 5 seconds for a dialogue to open
             boolean dialogueOpened = sleepUntil(Rs2Dialogue::isInDialogue, 5000);
             if (dialogueOpened) {
+                log.info("Dialogue opened, transitioning to SELECT_ROUTE");
                 setState(TempleTrekkingState.SELECT_ROUTE);
+            } else {
+                log.warn("Clicked Escort but no dialogue opened within 5s, retrying...");
             }
-            // If dialogue didn't open, we'll try again next tick
         }
     }
 
-    /**
-     * STATE: SELECT_ROUTE
-     *
-     * Goal: Navigate through the NPC dialogue and select Route 1 (easy route).
-     *
-     * The dialogue tree for Temple Trekking escort NPCs typically goes:
-     *   NPC: "Where would you like to go?"
-     *   → Player chooses from Route 1 / Route 2 / Route 3
-     *
-     * We click through any "Continue" prompts first, then select Route 1.
-     */
+    // =========================================================================
+    // STATE: SELECT_ROUTE
+    //
+    // Navigate the route selection dialogue and pick Route 1.
+    // The dialogue may have one or more "Continue" prompts before the
+    // route options appear — we handle both.
+    // =========================================================================
     private void handleSelectRoute() {
         if (!Rs2Dialogue.isInDialogue()) {
-            // Dialogue closed unexpectedly — go back to start
-            log.warn("Dialogue closed unexpectedly during route selection. Restarting...");
+            log.warn("Dialogue closed unexpectedly, returning to START_TREK");
             setState(TempleTrekkingState.START_TREK);
             return;
         }
 
-        // If there's a "Click here to continue" prompt, press space to advance
+        // Advance any "click to continue" prompts first
         if (Rs2Dialogue.hasContinue()) {
             Rs2Dialogue.clickContinue();
-            sleep(400, 700); // Small delay so the next dialogue widget loads
+            sleep(400, 700); // Wait for the next dialogue widget to render
             return;
         }
 
-        // If we see route options, pick Route 1
+        // Now look for the route selection options
         if (Rs2Dialogue.hasSelectAnOption()) {
-            // Try clicking "Route 1" — the exact text may contain additional info like "(Easy)"
-            // We use partial match (false = not exact) so "Route 1" matches "Route 1 (Easy Path)"
+            // Try clicking "Route 1" — partial match handles "Route 1 (Easy path)" etc.
             boolean clicked = Rs2Dialogue.clickOption("Route 1");
 
             if (!clicked) {
-                // Route 1 not found — log the available options for debugging
-                log.warn("Could not find 'Route 1' dialogue option. Available options: {}",
+                log.warn("Could not find 'Route 1' option. Visible options: {}",
                         Rs2Dialogue.getDialogueOptions());
-                // Wait a tick and try again
-                return;
+                return; // Retry next tick
             }
 
-            log.info("Selected Route 1. Waiting for trek to begin...");
-
-            // Wait until the dialogue closes (trek starts loading)
+            log.info("Selected Route 1, waiting for trek to begin...");
+            // Wait until dialogue closes (trek instance starts loading)
             sleepUntil(() -> !Rs2Dialogue.isInDialogue(), 8000);
+            bridgeMaterialsUsed = 0; // Reset bridge counter for new trek
             setState(TempleTrekkingState.TREKKING);
         }
     }
 
-    /**
-     * STATE: TREKKING
-     *
-     * Goal: Wait while the game is between events.
-     * Transition to DETECT_EVENT the moment anything unusual appears.
-     *
-     * For now this is a placeholder — in Phase 2 we'll add real detection logic.
-     * The key signals to watch for:
-     *   - Enemies spawning in the area
-     *   - Puzzle objects appearing (broken bridge, river without bridge, vine trees)
-     *   - The trek completion screen
-     *   - Reward token appearing in inventory
-     */
+    // =========================================================================
+    // STATE: TREKKING
+    //
+    // We're between events — just watching for something to happen.
+    // Checks every tick for:
+    //   1. Trek completion (reward token in inventory)
+    //   2. An event loading (enemies, puzzle objects appearing)
+    // =========================================================================
     private void handleTrekking() {
-        // Check if the trek has completed (reward token in inventory)
-        if (Rs2Inventory.contains("Reward token")) {
+        // Check if trek completed — reward token appears in inventory
+        if (hasRewardToken()) {
             log.info("Reward token detected — trek complete!");
             setState(TempleTrekkingState.TREK_COMPLETE);
             return;
         }
 
-        // TODO Phase 2: detect when an event area loads and transition to DETECT_EVENT
-        // For now, log that we're trekking and wait
-        // This prevents spam — only log occasionally
-        if (Math.random() < 0.05) { // ~5% chance per tick = roughly every 12 seconds
-            log.debug("Trekking — watching for events...");
+        // Check if we've entered an event area by looking for event-specific objects or enemies.
+        // The "Continue-trek" path object only appears inside event areas.
+        // So if we can see it, an event has loaded and we need to determine which type.
+        Rs2TileObjectModel continuePath = findObjectByName(OBJ_CONTINUE_PATH);
+        if (continuePath != null) {
+            log.info("Event area detected — running event detection");
+            setState(TempleTrekkingState.DETECT_EVENT);
+        }
+        // Otherwise just wait — next tick will check again
+    }
+
+    // =========================================================================
+    // STATE: DETECT_EVENT
+    //
+    // We're inside an event area. Figure out which type and route accordingly.
+    //
+    // Detection priority order:
+    //   1. Broken bridge + dead trees → BRIDGE_CHOP_TREES
+    //   2. Broken bridge + no dead trees → BRIDGE_KILL_ZOMBIES
+    //   3. Swamp tree with Cut-vine option → RIVER_CROSSING
+    //   4. Enemies present + evade path visible → EVADE_COMBAT
+    //   5. Nothing recognisable → UNKNOWN_EVENT
+    // =========================================================================
+    private void handleDetectEvent() {
+        // Check for broken bridge first — most reliable signal
+        boolean brokenBridgePresent = findObjectByName(OBJ_BROKEN_BRIDGE) != null
+                || findObjectByName(OBJ_PARTIALLY_BROKEN) != null
+                || findObjectByName(OBJ_SLIGHTLY_BROKEN) != null;
+
+        if (brokenBridgePresent) {
+            // Distinguish tree variant from lumberjack variant
+            boolean deadTreesPresent = findObjectByName(OBJ_DEAD_TREE) != null;
+
+            if (deadTreesPresent && config.doBridgeTrees()) {
+                log.info("Detected: Bridge event (dead trees)");
+                bridgeMaterialsUsed = 0;
+                setState(TempleTrekkingState.BRIDGE_CHOP_TREES);
+            } else if (!deadTreesPresent && config.doBridgeLumberjacks()) {
+                log.info("Detected: Bridge event (undead lumberjacks)");
+                bridgeMaterialsUsed = 0;
+                setState(TempleTrekkingState.BRIDGE_KILL_ZOMBIES);
+            } else {
+                // Bridge event but config says skip — treat as unknown for now
+                // Future: add "evade puzzle" logic here
+                log.info("Bridge event detected but config set to skip, treating as unknown");
+                setState(TempleTrekkingState.UNKNOWN_EVENT);
+            }
+            return;
+        }
+
+        // Check for river crossing — swamp tree with Cut-vine option
+        if (findObjectByName(OBJ_SWAMP_TREE) != null && config.doRiverCrossing()) {
+            log.info("Detected: River crossing event");
+            setState(TempleTrekkingState.RIVER_CROSSING);
+            return;
+        }
+
+        // Check for combat event — look for the evade path
+        // On Route 1, all combat events have an "Evade-event" path option
+        Rs2TileObjectModel evadePath = findObjectWithAction("Evade-event");
+        if (evadePath != null) {
+            log.info("Detected: Combat event (evade path visible)");
+            setState(TempleTrekkingState.EVADE_COMBAT);
+            return;
+        }
+
+        // Could be the Abidor Crank friendly event (free heal) — just continue
+        // Abidor Crank has no puzzle or combat, just walk to the continue path
+        log.info("No specific event detected — treating as friendly/unknown, continuing trek");
+        setState(TempleTrekkingState.CONTINUE_TREK);
+    }
+
+    // =========================================================================
+    // STATE: EVADE_COMBAT
+    //
+    // Find and click the "Evade-event" path option to skip the combat.
+    // On Route 1 this is always available for all combat events.
+    // =========================================================================
+    private void handleEvadeCombat() {
+        Rs2TileObjectModel evadePath = findObjectWithAction("Evade-event");
+
+        if (evadePath == null) {
+            log.warn("Evade path not found, waiting...");
+            return; // Retry next tick
+        }
+
+        log.info("Clicking Evade-event path...");
+        evadePath.click("Evade-event");
+
+        // Wait until the event area unloads (evade path disappears)
+        sleepUntil(() -> findObjectWithAction("Evade-event") == null, 10000);
+        setState(TempleTrekkingState.TREKKING);
+    }
+
+    // =========================================================================
+    // STATE: BRIDGE_CHOP_TREES
+    //
+    // Steps:
+    //   1. Chop all 3 dead trees (get 3 logs)
+    //   2. Use logs on bridge to repair it (3 logs needed)
+    //      - Each log changes: Broken → Partially broken → Slightly broken → Fixed
+    //   3. Cross the fixed bridge
+    //   4. Transition to CONTINUE_TREK
+    // =========================================================================
+    private void handleBridgeChopTrees() {
+        // --- Step 1: Chop trees until we have 3 logs ---
+        if (!Rs2Inventory.contains(ITEM_LOG) || Rs2Inventory.count(ITEM_LOG) < 3) {
+            Rs2TileObjectModel deadTree = findObjectByName(OBJ_DEAD_TREE);
+
+            if (deadTree != null) {
+                log.info("Chopping dead tree... (have {} logs)", Rs2Inventory.count(ITEM_LOG));
+                deadTree.click("Chop down");
+                // Wait until our animation starts (chopping) or stops (tree gone)
+                sleepUntil(() -> Rs2Player.isAnimating(), 3000);
+                // Then wait until we stop animating (tree chopped)
+                sleepUntil(() -> !Rs2Player.isAnimating(), 10000);
+            } else if (Rs2Inventory.count(ITEM_LOG) == 0) {
+                // No tree found and no logs — shouldn't happen, but guard against it
+                log.warn("No dead tree found and no logs in inventory during bridge event");
+                sleep(1000);
+            }
+            // If we have some logs but still need more, loop back next tick to find next tree
+            return;
+        }
+
+        // --- Step 2: Use logs to repair the bridge ---
+        // Find whichever form of broken bridge is currently present
+        Rs2TileObjectModel bridge = getBrokenBridge();
+
+        if (bridge == null) {
+            // Bridge is now fixed — move to crossing
+            Rs2TileObjectModel fixedBridge = findObjectByName(OBJ_FIXED_BRIDGE);
+            if (fixedBridge != null) {
+                log.info("Bridge fixed! Crossing...");
+                fixedBridge.click("Cross");
+                sleepUntil(() -> findObjectByName(OBJ_FIXED_BRIDGE) == null, 8000);
+                setState(TempleTrekkingState.CONTINUE_TREK);
+            }
+            return;
+        }
+
+        // Use a log on the broken bridge
+        // Rs2Inventory.use() selects the item (highlights it), then we click the bridge
+        log.info("Using log on bridge... (attempt {})", bridgeMaterialsUsed + 1);
+        Rs2Inventory.use(ITEM_LOG);   // Selects the log in inventory
+        sleep(300, 500);              // Short delay for selection to register
+        bridge.click();               // Click the bridge (triggers "use log on bridge")
+
+        // Wait for the dialogue that asks "Attempt to fix the bridge?"
+        boolean dialogueAppeared = sleepUntil(Rs2Dialogue::hasSelectAnOption, 4000);
+        if (dialogueAppeared) {
+            Rs2Dialogue.clickOption("Yes");
+            sleep(600, 900);
+        }
+
+        bridgeMaterialsUsed++;
+
+        // After 3 logs the bridge is fully fixed
+        // Wait a moment for the bridge object to update
+        sleep(800, 1200);
+    }
+
+    // =========================================================================
+    // STATE: BRIDGE_KILL_ZOMBIES
+    //
+    // Steps:
+    //   1. Kill Undead Lumberjacks as they spawn from the river
+    //   2. Loot their planks (need 3)
+    //   3. Use planks on bridge to repair (same 3-step process as logs)
+    //   4. Cross the fixed bridge
+    // =========================================================================
+    private void handleBridgeKillZombies() {
+        // --- Step 1 & 2: Kill lumberjacks and loot planks ---
+        if (Rs2Inventory.count(ITEM_PLANK) < 3) {
+
+            // Look for an Undead Lumberjack to attack
+            Rs2NpcModel lumberjack = Microbot.getRs2NpcCache().query()
+                    .withName("Undead Lumberjack")
+                    .nearest();
+
+            if (lumberjack != null && !Rs2Player.isInCombat()) {
+                log.info("Attacking Undead Lumberjack... (have {} planks)", Rs2Inventory.count(ITEM_PLANK));
+                lumberjack.click("Attack");
+                // Wait to enter combat
+                sleepUntil(() -> Rs2Player.isInCombat(), 3000);
+                // Wait until combat ends (lumberjack dies)
+                sleepUntil(() -> !Rs2Player.isInCombat(), 30000);
+                sleep(600); // Brief pause for loot to appear on ground
+            } else if (lumberjack == null) {
+                // No lumberjack spawned yet — wait for the next wave
+                log.debug("Waiting for Undead Lumberjack to spawn...");
+                sleep(1000);
+            }
+            // Don't return here — fall through to check if planks appeared on ground
+            // (loot is picked up automatically via auto-loot or we need to click it)
+            return;
+        }
+
+        // --- Step 3: Repair the bridge with planks ---
+        Rs2TileObjectModel bridge = getBrokenBridge();
+
+        if (bridge == null) {
+            // Bridge is fixed
+            Rs2TileObjectModel fixedBridge = findObjectByName(OBJ_FIXED_BRIDGE);
+            if (fixedBridge != null) {
+                log.info("Bridge fixed! Crossing...");
+                fixedBridge.click("Cross");
+                sleepUntil(() -> findObjectByName(OBJ_FIXED_BRIDGE) == null, 8000);
+                setState(TempleTrekkingState.CONTINUE_TREK);
+            }
+            return;
+        }
+
+        log.info("Using plank on bridge... (attempt {})", bridgeMaterialsUsed + 1);
+        Rs2Inventory.use(ITEM_PLANK);
+        sleep(300, 500);
+        bridge.click();
+
+        boolean dialogueAppeared = sleepUntil(Rs2Dialogue::hasSelectAnOption, 4000);
+        if (dialogueAppeared) {
+            Rs2Dialogue.clickOption("Yes");
+            sleep(600, 900);
+        }
+
+        bridgeMaterialsUsed++;
+        sleep(800, 1200);
+    }
+
+    // =========================================================================
+    // STATE: RIVER_CROSSING
+    //
+    // Steps:
+    //   1. Cut vine from Swamp tree 3 times (get 3 Short vines id:7778)
+    //   2. Combine 2 Short vines → use one on another (opens combine dialogue)
+    //   3. Combine result with 3rd short vine → Long vine (id:7777)
+    //   4. Use Long vine on Swamp tree branch
+    //   5. Click "Swing-from" Swamp tree branch
+    // =========================================================================
+    private void handleRiverCrossing() {
+        // --- Step 1: Get 3 short vines ---
+        int vineCount = Rs2Inventory.count(ITEM_SHORT_VINE);
+        if (vineCount < 3) {
+            Rs2TileObjectModel swampTree = findObjectByName(OBJ_SWAMP_TREE);
+
+            if (swampTree == null) {
+                log.warn("No Swamp tree found for vine cutting");
+                sleep(1000);
+                return;
+            }
+
+            log.info("Cutting vine... (have {}/3)", vineCount);
+            swampTree.click("Cut-vine");
+            // Wait for the vine to appear in inventory
+            int currentCount = vineCount;
+            sleepUntil(() -> Rs2Inventory.count(ITEM_SHORT_VINE) > currentCount, 5000);
+            return; // Come back next tick — may need to cut again
+        }
+
+        // --- Step 2 & 3: Combine short vines into long vine ---
+        if (!Rs2Inventory.contains(ITEM_LONG_VINE)) {
+            log.info("Combining short vines into long vine...");
+
+            // combine(primaryId, secondaryId) selects the first item and clicks the second —
+            // the correct way to combine two items in inventory by their IDs.
+            Rs2Inventory.combine(ITEM_SHORT_VINE, ITEM_SHORT_VINE);
+
+            // Wait for long vine to appear (two uses of combine produce long vine from 3 short vines)
+            sleepUntil(() -> Rs2Inventory.contains(ITEM_LONG_VINE), 5000);
+            return;
+        }
+
+        // --- Step 4: Use long vine on tree branch ---
+        Rs2TileObjectModel treeBranch = findObjectByName(OBJ_SWAMP_TREE_BRANCH);
+
+        if (treeBranch == null) {
+            log.warn("No Swamp tree branch found");
+            sleep(1000);
+            return;
+        }
+
+        // Check if we need to throw the vine (before it's attached)
+        // or swing from it (after it's attached)
+        String[] actions = treeBranch.getObjectComposition() != null
+                ? treeBranch.getObjectComposition().getActions()
+                : new String[]{};
+
+        boolean hasSwing = false;
+        boolean hasThrow = false;
+        for (String action : actions) {
+            if (action == null) continue;
+            if (action.equalsIgnoreCase("Swing-from")) hasSwing = true;
+            if (action.equalsIgnoreCase("Throw-to") || action.equalsIgnoreCase("Use")) hasThrow = true;
+        }
+
+        if (!hasSwing) {
+            // Need to throw/attach the vine first
+            log.info("Using long vine on tree branch...");
+            Rs2Inventory.use(ITEM_LONG_VINE); // Select long vine
+            sleep(300, 500);
+            treeBranch.click();               // Use on branch
+            sleepUntil(() -> {
+                // Wait until the branch gains a "Swing-from" option
+                Rs2TileObjectModel branch = findObjectByName(OBJ_SWAMP_TREE_BRANCH);
+                if (branch == null) return false;
+                String[] acts = branch.getObjectComposition() != null
+                        ? branch.getObjectComposition().getActions() : new String[]{};
+                for (String a : acts) {
+                    if ("Swing-from".equalsIgnoreCase(a)) return true;
+                }
+                return false;
+            }, 5000);
+        } else {
+            // --- Step 5: Swing across ---
+            log.info("Swinging from tree branch across river...");
+            treeBranch.click("Swing-from");
+            // Wait until we've crossed (branch disappears from scene)
+            sleepUntil(() -> findObjectByName(OBJ_SWAMP_TREE_BRANCH) == null, 8000);
+            setState(TempleTrekkingState.CONTINUE_TREK);
         }
     }
 
-    /**
-     * STATE: DETECT_EVENT
-     *
-     * Goal: Figure out which type of event we've entered and route to the right handler.
-     *
-     * This is the event router. It checks what's present in the environment
-     * and transitions to the appropriate handler state.
-     *
-     * Placeholder for Phase 2 — event detection logic will go here.
-     */
-    private void handleDetectEvent() {
-        log.info("Detecting event type...");
-
-        // TODO Phase 2: Implement event detection
-        // For now, log and go back to TREKKING as a safe fallback
-        // Once we implement detection, this will route to the right handler
-
-        // Example of what this will look like:
-        // if (isEnemiesPresent()) { setState(EVADE_COMBAT); return; }
-        // if (isBridgeWithTrees()) { setState(BRIDGE_CHOP_TREES); return; }
-        // if (isBridgeWithoutTrees()) { setState(BRIDGE_KILL_ZOMBIES); return; }
-        // if (isRiverCrossing()) { setState(RIVER_CROSSING); return; }
-        // setState(UNKNOWN_EVENT);
-
-        setState(TempleTrekkingState.TREKKING); // Placeholder
-    }
-
-    /**
-     * STATE: EVADE_COMBAT
-     *
-     * Goal: Find the "Evade-event" path object and click it.
-     *
-     * On Route 1, all combat events have an evade path — a set of tiles
-     * that, when clicked, skip the combat and continue the trek.
-     *
-     * Placeholder for Phase 2.
-     */
-    private void handleEvadeCombat() {
-        log.info("Evading combat event...");
-        // TODO Phase 2: Find and click the evade path object
-        setState(TempleTrekkingState.TREKKING);
-    }
-
-    /**
-     * STATE: BRIDGE_CHOP_TREES
-     *
-     * Goal: Chop trees → pick up logs → use logs on bridge gaps.
-     *
-     * Placeholder for Phase 3.
-     */
-    private void handleBridgeChopTrees() {
-        log.info("Handling bridge (chop trees) event...");
-        // TODO Phase 3: Implement tree chopping and bridge repair
-        setState(TempleTrekkingState.CONTINUE_TREK);
-    }
-
-    /**
-     * STATE: BRIDGE_KILL_ZOMBIES
-     *
-     * Goal: Wait for Undead Lumberjacks → kill them → loot planks → repair bridge.
-     *
-     * Placeholder for Phase 3.
-     */
-    private void handleBridgeKillZombies() {
-        log.info("Handling bridge (kill lumberjacks) event...");
-        // TODO Phase 3: Implement zombie killing and bridge repair
-        setState(TempleTrekkingState.CONTINUE_TREK);
-    }
-
-    /**
-     * STATE: RIVER_CROSSING
-     *
-     * Goal: Cut 3 vines → combine into long vine → throw at branch → swing across.
-     *
-     * Placeholder for Phase 4.
-     */
-    private void handleRiverCrossing() {
-        log.info("Handling river crossing event...");
-        // TODO Phase 4: Implement vine cutting and river crossing
-        setState(TempleTrekkingState.CONTINUE_TREK);
-    }
-
-    /**
-     * STATE: CONTINUE_TREK
-     *
-     * Goal: Find the blue "Continue-trek" path stones and click them.
-     *
-     * After every event resolves, there are blue stone tiles at the end
-     * of the event area that advance the trek. Clicking them returns us
-     * to the main path and may trigger the next event.
-     *
-     * Placeholder for Phase 2.
-     */
+    // =========================================================================
+    // STATE: CONTINUE_TREK
+    //
+    // Click the blue "Continue-trek" path stones to advance.
+    // =========================================================================
     private void handleContinueTrek() {
-        log.info("Continuing trek...");
-        // TODO Phase 2: Find and click the "Continue-trek" path object
+        Rs2TileObjectModel continuePath = findObjectWithAction("Continue-trek");
+
+        if (continuePath == null) {
+            // Path stones not visible yet, or already clicked — check if trek is done
+            if (hasRewardToken()) {
+                setState(TempleTrekkingState.TREK_COMPLETE);
+            } else {
+                // Just went through an event, back to trekking
+                setState(TempleTrekkingState.TREKKING);
+            }
+            return;
+        }
+
+        log.info("Clicking Continue-trek path...");
+        continuePath.click("Continue-trek");
+
+        // Wait for the event area to unload (path stones disappear)
+        sleepUntil(() -> findObjectWithAction("Continue-trek") == null, 10000);
         setState(TempleTrekkingState.TREKKING);
     }
 
-    /**
-     * STATE: TREK_COMPLETE
-     *
-     * Goal: The follower gave us a reward token. Increment the counter,
-     * then loop back to start the next trek.
-     *
-     * For now we just leave the token in inventory as requested.
-     */
+    // =========================================================================
+    // STATE: TREK_COMPLETE
+    //
+    // Trek finished — increment counter, leave token in inventory, restart.
+    // =========================================================================
     private void handleTrekComplete() {
         trekCount++;
-        log.info("Trek {} complete! Reward token in inventory. Starting next trek...", trekCount);
-
-        // Brief pause before starting next trek (feels more human-like)
-        sleep(1500, 2500);
-
+        log.info("Trek {} complete! Token in inventory. Starting next trek...", trekCount);
+        sleep(1500, 2500); // Brief pause before restarting
         setState(TempleTrekkingState.START_TREK);
     }
 
-    /**
-     * STATE: UNKNOWN_EVENT
-     *
-     * Goal: Something we don't recognize happened. Log it and try to recover.
-     */
+    // =========================================================================
+    // STATE: UNKNOWN_EVENT
+    //
+    // Unrecognised situation — log and try to recover by re-detecting.
+    // =========================================================================
     private void handleUnknownEvent() {
-        log.warn("Unknown event detected. Waiting 3 seconds before retrying detection...");
+        log.warn("Unknown event state. Waiting 3 seconds before retrying detection...");
         sleep(3000);
         setState(TempleTrekkingState.DETECT_EVENT);
     }
 
-    // -------------------------------------------------------------------------
-    // Utility methods
-    // -------------------------------------------------------------------------
+    // =========================================================================
+    // UTILITY METHODS
+    // =========================================================================
 
     /**
-     * Helper to find the first visible escort NPC from a list of possible names.
-     *
-     * @param names Array of NPC names to search for (any one of them will do)
-     * @return The first matching NPC found, or null if none are visible
+     * Returns the current form of broken bridge present in the scene,
+     * checking all three progressive states.
+     * Returns null if no broken bridge exists (i.e. it's fixed or not a bridge event).
      */
-    private Rs2NpcModel findEscortNpc(String[] names) {
-        for (String name : names) {
-            Rs2NpcModel npc = Rs2Npc.getNpc(name);
-            if (npc != null) {
-                return npc;
-            }
-        }
-        return null;
+    private Rs2TileObjectModel getBrokenBridge() {
+        Rs2TileObjectModel bridge = findObjectByName(OBJ_BROKEN_BRIDGE);
+        if (bridge != null) return bridge;
+        bridge = findObjectByName(OBJ_PARTIALLY_BROKEN);
+        if (bridge != null) return bridge;
+        return findObjectByName(OBJ_SLIGHTLY_BROKEN);
     }
 
     /**
-     * Central state transition method.
+     * Finds the nearest tile object matching a given name (case-insensitive).
+     * Uses the new Rs2TileObjectCache — the non-deprecated way to find objects.
      *
-     * Using a single method for all transitions means we can add logging,
-     * debugging, or validation in one place later.
+     * @param name The exact name of the object to find
+     * @return The nearest matching object, or null if not found
+     */
+    private Rs2TileObjectModel findObjectByName(String name) {
+        return Microbot.getRs2TileObjectCache().query()
+                .withName(name)
+                .nearest();
+    }
+
+    /**
+     * Finds the nearest tile object that has a specific right-click action available.
+     * Useful for finding path stones by their "Continue-trek" or "Evade-event" action
+     * since both path types share the same object name "Path".
      *
-     * @param newState The state to transition to
+     * @param action The action string to search for (e.g., "Continue-trek")
+     * @return The nearest matching object, or null if not found
+     */
+    private Rs2TileObjectModel findObjectWithAction(String action) {
+        return Microbot.getRs2TileObjectCache().query()
+                .where(obj -> {
+                    // Get the object's composition to check its actions array
+                    var comp = obj.getObjectComposition();
+                    if (comp == null) return false;
+                    String[] actions = comp.getActions();
+                    if (actions == null) return false;
+                    for (String a : actions) {
+                        if (action.equalsIgnoreCase(a)) return true;
+                    }
+                    return false;
+                })
+                .nearest();
+    }
+
+    /**
+     * Checks whether a reward token is in the player's inventory.
+     * Checks by name since there are blue/yellow/red variants.
+     */
+    private boolean hasRewardToken() {
+        return Rs2Inventory.contains("Reward token");
+    }
+
+    /**
+     * Central state transition — all state changes go through here.
+     * Having one place for transitions makes debugging much easier.
      */
     private void setState(TempleTrekkingState newState) {
         if (currentState != newState) {
@@ -501,20 +694,14 @@ public class TempleTrekkingScript extends Script {
         }
     }
 
-    // -------------------------------------------------------------------------
-    // Shutdown
-    // -------------------------------------------------------------------------
+    // =========================================================================
+    // SHUTDOWN
+    // =========================================================================
 
-    /**
-     * Called by TempleTrekkingPlugin.shutDown().
-     *
-     * ALWAYS call super.shutdown() — it cancels the scheduled executor
-     * and cleans up Microbot's internal state.
-     */
     @Override
     public void shutdown() {
-        super.shutdown();
+        super.shutdown(); // ALWAYS call this first — cancels the executor
         currentState = TempleTrekkingState.IDLE;
-        log.info("Temple Trekking script shut down. Total treks completed: {}", trekCount);
+        log.info("Temple Trekking script shut down. Total treks this session: {}", trekCount);
     }
 }
