@@ -397,6 +397,12 @@ public class Rs2ActorModel implements Actor
     }
 
     @Override
+    public int getFootprintSize()
+    {
+        return actor.getFootprintSize();
+    }
+
+    @Override
     public int getAnimationHeightOffset()
     {
         return actor.getAnimationHeightOffset();

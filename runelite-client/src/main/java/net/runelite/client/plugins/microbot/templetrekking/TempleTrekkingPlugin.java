@@ -1,6 +1,8 @@
 package net.runelite.client.plugins.microbot.templetrekking;
 
+import com.google.inject.Provides;
 import lombok.extern.slf4j.Slf4j;
+import net.runelite.client.config.ConfigManager;
 import net.runelite.client.plugins.Plugin;
 import net.runelite.client.plugins.PluginDescriptor;
 import net.runelite.client.ui.overlay.OverlayManager;
@@ -103,6 +105,12 @@ public class TempleTrekkingPlugin extends Plugin {
         log.info("Temple Trekking plugin shut down.");
     }
 
-    // Note: RuneLite automatically wires up Config interfaces that extend Config
-    // and are annotated with @ConfigGroup. No @Provides method needed here.
+    // This @Provides method is REQUIRED by Guice (RuneLite's dependency injection).
+    // Without it, the client throws a CreationException on startup because Guice
+    // doesn't know how to construct TempleTrekkingConfig on its own.
+    // ConfigManager reads/writes the settings from disk using the @ConfigGroup name.
+    @Provides
+    TempleTrekkingConfig provideConfig(ConfigManager configManager) {
+        return configManager.getConfig(TempleTrekkingConfig.class);
+    }
 }
