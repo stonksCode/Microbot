@@ -2,8 +2,6 @@ package net.runelite.client.plugins.microbot.templetrekking;
 
 import lombok.Getter;
 import lombok.extern.slf4j.Slf4j;
-import net.runelite.api.coords.WorldArea;
-import net.runelite.api.coords.WorldPoint;
 import net.runelite.client.plugins.microbot.Microbot;
 import net.runelite.client.plugins.microbot.Script;
 import net.runelite.client.plugins.microbot.api.tileobject.models.Rs2TileObjectModel;
@@ -11,7 +9,6 @@ import net.runelite.client.plugins.microbot.api.npc.models.Rs2NpcModel;
 import net.runelite.client.plugins.microbot.util.dialogues.Rs2Dialogue;
 import net.runelite.client.plugins.microbot.util.inventory.Rs2Inventory;
 import net.runelite.client.plugins.microbot.util.player.Rs2Player;
-import net.runelite.client.plugins.microbot.util.walker.Rs2Walker;
 import net.runelite.client.plugins.microbot.util.widget.Rs2Widget;
 
 import java.time.Instant;
@@ -20,93 +17,61 @@ import java.util.concurrent.TimeUnit;
 import static net.runelite.client.plugins.microbot.util.Global.sleep;
 import static net.runelite.client.plugins.microbot.util.Global.sleepUntil;
 
-/**
- * TempleTrekkingScript — the full state machine for automating Temple Trekking.
- *
- * KEY CONCEPTS FOR LEARNING:
- *
- * 1. STATE MACHINE: The bot is always in exactly one state. Each tick, the switch
- *    statement calls the handler for that state. Handlers either do work or change
- *    the state. This makes complex multi-step logic easy to reason about.
- *
- * 2. NEW API vs OLD API:
- *    Old (deprecated): Rs2Npc.getNpc("Name")  /  Rs2Npc.interact(npc, "action")
- *    New (use this):   Microbot.getRs2NpcCache().query().withName("Name").nearest()
- *                      npc.click("action")
- *    Same pattern applies to objects: Microbot.getRs2TileObjectCache().query()...
- *
- * 3. NULL CHECKS: Game objects can disappear between ticks. Always null-check
- *    before using a result from a query.
- *
- * 4. sleepUntil(): Pauses until a condition is true OR a timeout expires.
- *    Returns true if condition was met, false if it timed out.
- *    Only safe to call from our background thread — never from the client thread.
- */
 @Slf4j
 public class TempleTrekkingScript extends Script {
 
     // =========================================================================
     // NPC IDs — verified in-game
-    // Using IDs is more reliable than names because names can change with
-    // game updates, but IDs are stable.
     // =========================================================================
 
-    // Burgh de Rott side (Temple Trekking start) — easy followers
-    private static final int NPC_FYIONA_FRAY   = 1567;
-    private static final int NPC_DALCIAN_FANG  = 1566;
-
-    // Paterdomus side (Burgh de Rott Ramble start) — easy followers
-    private static final int NPC_ADVENTURER    = 1577;
-    private static final int NPC_MAGE          = 1578;
+    private static final int NPC_FYIONA_FRAY  = 1567;
+    private static final int NPC_DALCIAN_FANG = 1566;
+    private static final int NPC_ADVENTURER   = 1577;
+    private static final int NPC_MAGE         = 1578;
 
     // =========================================================================
     // Item IDs — verified in-game
     // =========================================================================
 
-    private static final int ITEM_SHORT_VINE   = 7778;  // Cut from swamp trees (need 3)
-    private static final int ITEM_LONG_VINE    = 7777;  // Combined from short vines
-    private static final int ITEM_LOG          = 1511;  // Chopped from dead trees
-    private static final int ITEM_PLANK        = 960;   // Looted from Undead Lumberjacks
+    private static final int ITEM_SHORT_VINE = 7778;
+    private static final int ITEM_LONG_VINE  = 7777;
+    private static final int ITEM_LOG        = 1511;
+    private static final int ITEM_PLANK      = 960;
 
     // =========================================================================
-    // Object names used in queries
-    // We query by name because Temple Trekking uses instanced areas where
-    // object IDs may vary. Names are consistent within the minigame.
+    // Object IDs — verified in-game
+    // NOTE: The Continue-trek path stone (id:13832) is intentionally NOT
+    // referenced anywhere in this script. We never click it — the game
+    // advances the trek automatically once we cross/evade each event.
     // =========================================================================
 
-    // Path stones that advance the trek
-    private static final String OBJ_CONTINUE_PATH  = "Path";       // Blue stones: "Continue-trek"
-    private static final String OBJ_EVADE_PATH      = "Path";       // Same object type, different option
+    // Path stones
+    private static final int OBJ_EVADE_PATH = 13831; // Present ONLY in combat events
 
-    // Bridge event objects — verified IDs
-    private static final int OBJ_DEAD_TREE             = 1365;  // Chop for logs
-    private static final int OBJ_BROKEN_BRIDGE         = 13834; // Stage 1 — use 1st log
-    private static final int OBJ_PARTIALLY_BROKEN      = 13835; // Stage 2 — use 2nd log
-    private static final int OBJ_SLIGHTLY_BROKEN       = 13836; // Stage 3 — use 3rd log
-    private static final int OBJ_FIXED_BRIDGE          = 13837; // Cross this to finish
+    // Bridge event
+    private static final int OBJ_DEAD_TREE        = 1365;
+    private static final int OBJ_BROKEN_BRIDGE    = 13834;
+    private static final int OBJ_PARTIALLY_BROKEN = 13835;
+    private static final int OBJ_SLIGHTLY_BROKEN  = 13836;
+    private static final int OBJ_FIXED_BRIDGE     = 13837;
 
-    // River event objects — IDs verified in-game
-    private static final int OBJ_SWAMP_TREE               = 13847; // Cut-vine to get Short vines
-    private static final int OBJ_SWAMP_TREE_BRANCH_BARE   = 13845; // Before long vine is attached
-    private static final int OBJ_SWAMP_TREE_BRANCH_VINE   = 13846; // After long vine attached — Swing-from
+    // River crossing event
+    // The swamp tree changes ID as vines are cut (tracks remaining vines):
+    private static final int OBJ_SWAMP_TREE_3    = 13847; // 3 vines remaining (fresh)
+    private static final int OBJ_SWAMP_TREE_2    = 13848; // 2 vines remaining
+    private static final int OBJ_SWAMP_TREE_1    = 13849; // 1 vine remaining
+    private static final int OBJ_SWAMP_TREE_BRANCH_BARE = 13845; // before vine attached
+    private static final int OBJ_SWAMP_TREE_BRANCH_VINE = 13846; // after vine attached — Swing-from
 
-    // =========================================================================
-    // Start locations — approximate WorldPoints for walking to start area.
-    // NOTE: Verify these in-game with RuneLite's Tile Location plugin.
-    // =========================================================================
-    private static final WorldPoint RAMBLE_START_LOCATION = new WorldPoint(3408, 3479, 0);
-    private static final WorldPoint TREK_START_LOCATION   = new WorldPoint(3494, 3215, 0);
-
-    /**
-     * Paterdomus temple area — the region around the start NPCs.
-     * We use this to detect whether we're at the start area or inside a trek instance.
-     * A WorldArea is a rectangle defined by (x, y, width, height, plane).
-     * If the player is OUTSIDE this area after selecting a route, they're in the trek.
-     */
-    private static final WorldArea PATERDOMUS_START_AREA = new WorldArea(3400, 3460, 30, 30, 0);
+    // All escort NPCs across both directions — any one of these being visible
+    // means we are at a valid start point and can begin a trek.
+    private static final int[] ALL_ESCORT_NPC_IDS = {
+            NPC_FYIONA_FRAY, NPC_DALCIAN_FANG, // Temple Trekking (Paterdomus side)
+            NPC_ADVENTURER, NPC_MAGE            // Burgh de Rott Ramble (Burgh side)
+    };
 
     // =========================================================================
-    // State tracking (exposed to overlay via @Getter)
+    // State
     // =========================================================================
 
     @Getter private TempleTrekkingState currentState = TempleTrekkingState.IDLE;
@@ -114,24 +79,16 @@ public class TempleTrekkingScript extends Script {
     @Getter private Instant startTime;
 
     private TempleTrekkingConfig config;
-
-    // Tracks how many logs/planks we've used to repair the current bridge
-    // so we know when the bridge is fully fixed.
     private int bridgeMaterialsUsed = 0;
-
-    /**
-     * Set to true once we've successfully selected a route.
-     * Prevents the bot from trying to start a new trek while one is already running.
-     * Reset to false when TREK_COMPLETE is reached.
-     */
-    private boolean trekInProgress = false;
+    private boolean trekInProgress  = false;
+    private boolean routeClicked    = false;
 
     // =========================================================================
     // Entry point
     // =========================================================================
 
     public boolean run(TempleTrekkingConfig config) {
-        this.config = config;
+        this.config    = config;
         this.startTime = Instant.now();
         this.currentState = TempleTrekkingState.START_TREK;
 
@@ -143,18 +100,16 @@ public class TempleTrekkingScript extends Script {
                 if (!Microbot.isLoggedIn()) return;
 
                 switch (currentState) {
-                    case IDLE:               break;
-                    case START_TREK:         handleStartTrek();        break;
-                    case SELECT_ROUTE:       handleSelectRoute();      break;
-                    case TREKKING:           handleTrekking();         break;
-                    case DETECT_EVENT:       handleDetectEvent();      break;
-                    case EVADE_COMBAT:       handleEvadeCombat();      break;
-                    case BRIDGE_CHOP_TREES:  handleBridgeChopTrees();  break;
-                    case BRIDGE_KILL_ZOMBIES:handleBridgeKillZombies();break;
-                    case RIVER_CROSSING:     handleRiverCrossing();    break;
-                    case CONTINUE_TREK:      handleContinueTrek();     break;
-                    case TREK_COMPLETE:      handleTrekComplete();     break;
-                    case UNKNOWN_EVENT:      handleUnknownEvent();     break;
+                    case IDLE:                break;
+                    case START_TREK:          handleStartTrek();         break;
+                    case SELECT_ROUTE:        handleSelectRoute();       break;
+                    case TREKKING:            handleTrekking();          break;
+                    case DETECT_EVENT:        handleDetectEvent();       break;
+                    case EVADE_COMBAT:        handleEvadeCombat();       break;
+                    case BRIDGE_CHOP_TREES:   handleBridgeChopTrees();   break;
+                    case BRIDGE_KILL_ZOMBIES: handleBridgeKillZombies(); break;
+                    case RIVER_CROSSING:      handleRiverCrossing();     break;
+                    case TREK_COMPLETE:       handleTrekComplete();      break;
                     default: log.warn("Unhandled state: {}", currentState); break;
                 }
             } catch (Exception e) {
@@ -168,47 +123,34 @@ public class TempleTrekkingScript extends Script {
     // =========================================================================
     // STATE: START_TREK
     //
-    // Find an easy escort NPC and right-click "Escort" to start.
-    // Guards against trying to start while a trek is already in progress.
+    // Looks for any escort NPC from either trek direction — whichever end the
+    // player is at after the previous trek completes. No walking, no hardcoded
+    // locations. If no escort NPC is visible, log an error and shut down.
     // =========================================================================
     private void handleStartTrek() {
-        // Safety guard: if we already started a trek this session, go straight
-        // to TREKKING rather than trying to talk to the NPC again.
-        // This handles the case where the bot restarts but the trek is still running.
         if (trekInProgress) {
-            log.info("Trek already in progress, resuming TREKKING state...");
+            log.info("Trek already in progress, resuming TREKKING...");
             setState(TempleTrekkingState.TREKKING);
             return;
         }
 
-        // Pick which NPC IDs and start location to use based on direction config
-        int[] npcIds = config.trekDirection() == TempleTrekkingConfig.TrekDirection.BURGH_DE_ROTT_RAMBLE
-                ? new int[]{NPC_ADVENTURER, NPC_MAGE}
-                : new int[]{NPC_FYIONA_FRAY, NPC_DALCIAN_FANG};
-
-        WorldPoint startLocation = config.trekDirection() == TempleTrekkingConfig.TrekDirection.BURGH_DE_ROTT_RAMBLE
-                ? RAMBLE_START_LOCATION
-                : TREK_START_LOCATION;
-
         Rs2NpcModel escortNpc = Microbot.getRs2NpcCache().query()
-                .withIds(npcIds)
+                .withIds(ALL_ESCORT_NPC_IDS)
                 .nearest();
 
         if (escortNpc == null) {
-            log.info("Escort NPC not found nearby, walking to start area...");
-            Rs2Walker.walkTo(startLocation);
+            log.error("No escort NPC found nearby (ids: 1566/1567/1577/1578). " +
+                      "Ensure the player is at a trek start point. Shutting down.");
+            shutdown();
             return;
         }
 
         log.info("Found escort NPC: {} (id={}). Clicking Escort...", escortNpc.getName(), escortNpc.getId());
-        boolean clicked = escortNpc.click("Escort");
-
-        if (clicked) {
-            // Human-like delay before the dialogue opens
+        if (escortNpc.click("Escort")) {
             sleep(600, 1200);
-            boolean dialogueOpened = sleepUntil(Rs2Dialogue::isInDialogue, 5000);
-            if (dialogueOpened) {
+            if (sleepUntil(Rs2Dialogue::isInDialogue, 5000)) {
                 log.info("Dialogue opened, transitioning to SELECT_ROUTE");
+                routeClicked = false;
                 setState(TempleTrekkingState.SELECT_ROUTE);
             } else {
                 log.warn("Clicked Escort but no dialogue opened within 5s, retrying...");
@@ -219,134 +161,78 @@ public class TempleTrekkingScript extends Script {
     // =========================================================================
     // STATE: SELECT_ROUTE
     //
-    // After clicking Escort, the game shows:
-    //   1. A standard dialogue: "Which route should we take?" — click Continue
-    //   2. A custom MAP widget opens with route options (not a standard dialogue)
-    //      The map has clickable regions with a "Select" action for each route.
-    //      We click "Route One" (or whatever the widget text is) using Rs2Widget.
-    //   3. After selecting, the map closes and two path stones appear:
-    //      - "Continue-trek Path" (reopens map)
-    //      - "Return-to-Paterdomus Path" (abandons trek)
-    //      We ignore the map entirely and click "Continue-trek Path" directly.
-    //   4. That transitions us into the trek instance proper.
+    // Sequence: dialogue(s) → route map widget → TREKKING.
+    // We NEVER interact with the Continue-trek path stone here or anywhere else.
     // =========================================================================
     private void handleSelectRoute() {
 
-        // --- Step 1: Drain ALL standard dialogues before the map opens ---
-        // Sequence: dialogue 1 → teleport to new location → dialogue 2 → dialogue 3 → map.
-        // The teleport causes a brief moment where isInDialogue() returns false even
-        // though more dialogues are coming. We handle this by:
-        //   a) After each Continue click, waiting up to 3s for the next dialogue OR map
-        //   b) If neither appears within 3s, THEN we check for map/path stones
+        // Step 1: Click through any standard dialogues
         if (Rs2Dialogue.isInDialogue()) {
             if (Rs2Dialogue.hasContinue()) {
                 sleep(400, 800);
                 Rs2Dialogue.clickContinue();
-                // Wait for: next dialogue box, OR map widget, OR teleport + new dialogue
-                // 3s covers the teleport animation + new dialogue rendering time
                 sleepUntil(() -> Rs2Dialogue.isInDialogue() || Rs2Widget.isWidgetVisible(329, 21), 3000);
             } else {
-                // Dialogue open but no Continue yet — mid-render, wait a tick
                 sleep(300, 500);
             }
             return;
         }
 
-        // If we just came out of a dialogue and the map isn't visible yet,
-        // give it a moment — we may be mid-teleport with more dialogues incoming.
+        // Wait briefly for map or another dialogue after a teleport
         if (!Rs2Widget.isWidgetVisible(329, 21) && !trekInProgress) {
-            // Wait briefly to see if another dialogue or the map appears
-            boolean somethingAppeared = sleepUntil(
+            boolean appeared = sleepUntil(
                 () -> Rs2Dialogue.isInDialogue() || Rs2Widget.isWidgetVisible(329, 21),
                 2500
             );
-            if (!somethingAppeared) {
-                // Nothing appeared — fall through to path stone check below
-                log.debug("SELECT_ROUTE: No dialogue or map after 2.5s, checking for path stones...");
-            } else {
-                return; // Something appeared, handle it next tick
-            }
+            if (appeared) return;
+            log.debug("SELECT_ROUTE: nothing after 2.5s, continuing...");
         }
 
-        // --- Step 2: Handle the route map widget ---
-        // Click Route 1 exactly once, then block here until the map closes.
-        // We do NOT return after clicking — we stay in this call until the map
-        // is gone so the scheduler cannot re-enter and click a second time.
+        // Step 2: Click Route 1 on the map widget exactly once
         if (Rs2Widget.isWidgetVisible(329, 21)) {
-            log.info("Route map open, clicking Route 1 (329, 21)...");
-            sleep(600, 1200);
-
-            boolean clicked = Rs2Widget.clickWidget(329, 21);
-            if (!clicked) {
-                log.warn("Failed to click Route 1 widget, will retry next tick...");
-                return;
+            if (!routeClicked) {
+                log.info("Route map open, clicking Route 1 (329, 21)...");
+                sleep(400, 800);
+                if (!Rs2Widget.clickWidget(329, 21)) {
+                    log.warn("Failed to click Route 1, retrying next tick...");
+                    return;
+                }
+                routeClicked = true;
+                log.info("Route 1 clicked, waiting for map to close...");
             }
-
-            // Block until the map widget is gone (up to 10s).
-            // Keeping this in one call prevents the scheduler re-entering and clicking again.
-            log.info("Route 1 clicked, waiting for map to close...");
-            sleepUntil(() -> !Rs2Widget.isWidgetVisible(329, 21), 10000);
-            sleep(500, 900);
+            sleep(200);
             return;
         }
 
-        // --- Step 3: Map is gone — look for the Continue-trek path stone ---
-        // After the map closes (either by selecting a route OR by dismissing it),
-        // two tile objects appear. We want "Continue-trek Path".
-        // Clicking it either starts the trek leg directly, or reopens the map.
-        // Either way, once we've clicked it we mark the trek as in progress.
-        Rs2TileObjectModel continuePath = findObjectWithAction("Continue-trek");
-        if (continuePath != null) {
-            log.info("Found Continue-trek path stone, clicking...");
-            sleep(500, 1000);
-            continuePath.click("Continue-trek");
-
-            // Mark trek in progress immediately
-            trekInProgress = true;
-            bridgeMaterialsUsed = 0;
-
-            // Wait for the path stones to disappear (trek instance loading)
-            sleepUntil(() -> findObjectWithAction("Continue-trek") == null, 10000);
-            sleep(1000, 2000); // Let the instance finish loading
-
-            log.info("Trek started. Transitioning to TREKKING.");
-            setState(TempleTrekkingState.TREKKING);
-            return;
-        }
-
-        // --- Fallback: nothing visible yet, wait ---
-        // Could be mid-animation or mid-load
-        if (trekInProgress) {
-            log.info("Trek already in progress, transitioning to TREKKING.");
-            setState(TempleTrekkingState.TREKKING);
-        } else {
-            log.debug("SELECT_ROUTE: waiting for map or path stones to appear...");
-        }
+        // Step 3: Map is gone — trek instance is loading, move to TREKKING.
+        // The Continue-trek path stone may appear here but we ignore it entirely.
+        log.info("Route map closed. Transitioning to TREKKING.");
+        trekInProgress    = true;
+        bridgeMaterialsUsed = 0;
+        setState(TempleTrekkingState.TREKKING);
     }
 
     // =========================================================================
     // STATE: TREKKING
     //
-    // Walking between events. We trigger event detection only when we are
-    // confident an event area has fully loaded — indicated by the presence of
-    // a puzzle object (bridge, swamp tree) OR an Evade-event path option.
-    // We deliberately do NOT trigger on the Continue-trek path alone, because
-    // that stone exists in every event area including ones that aren't loaded yet.
+    // Idle between events. Transition to DETECT_EVENT only when a known puzzle
+    // object is visible. Never look for or interact with the Continue-trek stone.
     // =========================================================================
     private void handleTrekking() {
-        if (hasRewardToken()) {
-            log.info("Reward token detected — trek complete!");
+        // Trek is complete when we are back at the start area with the escort NPC visible.
+        // We do NOT check for reward tokens — they accumulate in inventory intentionally.
+        if (trekInProgress && isAtEndpoint()) {
+            log.info("Endpoint NPC visible (Hiylik Myna/Florin) — trek complete!");
             trekInProgress = false;
             setState(TempleTrekkingState.TREK_COMPLETE);
             return;
         }
 
-        // Handle the pseudo-map / inter-event dialogue screen
+        // Handle pseudo-map dialogue between segments
         if (Rs2Dialogue.isInDialogue()) {
             if (Rs2Dialogue.hasSelectAnOption()) {
-                boolean continued = Rs2Dialogue.clickOption("Continue on the trek");
-                if (continued) {
-                    log.info("Clicked 'Continue on the trek' from map screen");
+                if (Rs2Dialogue.clickOption("Continue on the trek")) {
+                    log.info("Clicked 'Continue on the trek'");
                     sleep(1000, 2000);
                     return;
                 }
@@ -359,53 +245,42 @@ public class TempleTrekkingScript extends Script {
             return;
         }
 
-        // Only enter DETECT_EVENT when a known puzzle object is visible.
-        // Log exactly what triggered detection so we can verify in the log.
-        boolean bridge      = findObjectById(OBJ_BROKEN_BRIDGE) != null
-                           || findObjectById(OBJ_PARTIALLY_BROKEN) != null
-                           || findObjectById(OBJ_SLIGHTLY_BROKEN) != null;
-        boolean swampTree   = findObjectById(OBJ_SWAMP_TREE) != null;
-        boolean evadePath   = findObjectWithAction("Evade-event") != null;
+        // Detect event areas by their puzzle objects only — never by path stones
+        boolean bridge    = findObjectById(OBJ_BROKEN_BRIDGE)    != null
+                         || findObjectById(OBJ_PARTIALLY_BROKEN) != null
+                         || findObjectById(OBJ_SLIGHTLY_BROKEN)  != null;
+        boolean swampTree = findSwampTree() != null;
+        boolean combat    = findObjectById(OBJ_EVADE_PATH) != null;
 
-        if (bridge || swampTree || evadePath) {
-            log.info("Event detected — bridge={} swampTree={} evade={}", bridge, swampTree, evadePath);
+        if (bridge || swampTree || combat) {
+            log.info("Event area loaded — bridge={} swampTree={} combat={}", bridge, swampTree, combat);
             setState(TempleTrekkingState.DETECT_EVENT);
         }
-        // Otherwise idle — next tick will check again
+        // Otherwise idle — still walking between events
     }
 
     // =========================================================================
     // STATE: DETECT_EVENT
     //
-    // Identify which event has loaded and route to the correct handler.
-    //
-    // Detection order (per your design):
-    //   1. Evade-event path visible → EVADE_COMBAT (combat events only have this)
-    //   2. Broken bridge present → check for dead tree
-    //      a. Dead tree present → BRIDGE_CHOP_TREES
-    //      b. No dead tree → BRIDGE_KILL_ZOMBIES (lumberjacks)
-    //   3. Swamp tree present → RIVER_CROSSING
-    //   4. None of the above → wait and re-detect (never fall through to continue)
+    // Identify the event type and route to the correct handler.
+    // If unrecognised, log all nearby objects and shut down.
     // =========================================================================
     private void handleDetectEvent() {
         logNearbyObjects();
 
-        // 1. Combat events: only they have the Evade-event path option
-        if (findObjectWithAction("Evade-event") != null) {
-            log.info("Detected: Combat event (Evade-event path visible)");
+        // Combat: Evade-event path stone (id:13831) present
+        if (findObjectById(OBJ_EVADE_PATH) != null) {
+            log.info("Detected: Combat event (id:13831 visible)");
             setState(TempleTrekkingState.EVADE_COMBAT);
             return;
         }
 
-        // 2. Bridge events: broken bridge is present
-        boolean brokenBridgePresent =
-                findObjectById(OBJ_BROKEN_BRIDGE) != null ||
-                findObjectById(OBJ_PARTIALLY_BROKEN) != null ||
-                findObjectById(OBJ_SLIGHTLY_BROKEN) != null;
-
-        if (brokenBridgePresent) {
-            boolean deadTreePresent = findObjectById(OBJ_DEAD_TREE) != null;
-            if (deadTreePresent) {
+        // Bridge: any broken bridge stage present
+        boolean brokenBridge = findObjectById(OBJ_BROKEN_BRIDGE)    != null
+                            || findObjectById(OBJ_PARTIALLY_BROKEN) != null
+                            || findObjectById(OBJ_SLIGHTLY_BROKEN)  != null;
+        if (brokenBridge) {
+            if (findObjectById(OBJ_DEAD_TREE) != null) {
                 log.info("Detected: Bridge event — dead trees");
                 bridgeMaterialsUsed = 0;
                 setState(TempleTrekkingState.BRIDGE_CHOP_TREES);
@@ -417,291 +292,266 @@ public class TempleTrekkingScript extends Script {
             return;
         }
 
-        // 3. River crossing: swamp tree present
-        if (findObjectById(OBJ_SWAMP_TREE) != null) {
+        // River crossing: any swamp tree variant present
+        if (findSwampTree() != null) {
             log.info("Detected: River crossing event");
             setState(TempleTrekkingState.RIVER_CROSSING);
             return;
         }
 
-        // Nothing matched yet — the area may still be loading. Wait and retry.
-        // NEVER fall through to CONTINUE_TREK from here.
-        log.debug("DETECT_EVENT: no puzzle objects found yet, waiting for area to load...");
-        sleep(500);
+        // Unknown — should never happen on Route 1
+        log.error("DETECT_EVENT: unrecognised event type. Check nearby object log above. Shutting down.");
+        shutdown();
     }
 
     // =========================================================================
     // STATE: EVADE_COMBAT
-    //
-    // Find and click the "Evade-event" path option to skip the combat.
-    // On Route 1 this is always available for all combat events.
     // =========================================================================
     private void handleEvadeCombat() {
-        Rs2TileObjectModel evadePath = findObjectWithAction("Evade-event");
-
+        Rs2TileObjectModel evadePath = findObjectById(OBJ_EVADE_PATH);
         if (evadePath == null) {
-            log.warn("Evade path not found, waiting...");
+            log.warn("Evade path (id:13831) not found, waiting...");
             return;
         }
 
-        log.info("Clicking Evade-event path...");
+        log.info("Clicking Evade-event path (id:13831)...");
         evadePath.click("Evade-event");
-        sleepUntil(() -> findObjectWithAction("Evade-event") == null, 10000);
-        setState(TempleTrekkingState.CONTINUE_TREK);
+        sleepUntil(() -> findObjectById(OBJ_EVADE_PATH) == null, 10000);
+        setState(TempleTrekkingState.TREKKING);
     }
 
     // =========================================================================
     // STATE: BRIDGE_CHOP_TREES
     //
-    // Steps:
-    //   1. Chop all 3 dead trees (get 3 logs)
-    //   2. Use logs on bridge to repair it (3 logs needed)
-    //      - Each log changes: Broken → Partially broken → Slightly broken → Fixed
-    //   3. Cross the fixed bridge
-    //   4. Transition to CONTINUE_TREK
+    // Bridge repair stages (object IDs, verified in-game):
+    //   Stage 0 — Broken bridge       id:13834  (use 1st log)
+    //   Stage 1 — Partially repaired  id:13835  (use 2nd log)
+    //   Stage 2 — Almost repaired     id:13836  (use 3rd log)
+    //   Stage 3 — Fixed bridge        id:13837  (cross to finish)
+    //
+    // Phase A: Chop trees until inventory has exactly 3 logs. Do NOT enter
+    //          repair phase until all 3 are collected.
+    // Phase B: Repair bridge one log at a time. After each log, poll until
+    //          the bridge advances to the next stage or becomes fixed.
+    //          Only cross once id:13837 is confirmed present.
     // =========================================================================
     private void handleBridgeChopTrees() {
-        // --- Step 1: Chop all 3 dead trees (id:1365) to get 3 logs ---
-        if (Rs2Inventory.count(ITEM_LOG) < 3) {
-            Rs2TileObjectModel deadTree = findObjectById(OBJ_DEAD_TREE); // id:1365
+        int logs = Rs2Inventory.count(ITEM_LOG);
 
-            if (deadTree != null) {
-                log.info("Chopping dead tree (id:1365)... (have {} logs)", Rs2Inventory.count(ITEM_LOG));
-                deadTree.click("Chop down");
-                sleepUntil(Rs2Player::isAnimating, 3000);
-                sleepUntil(() -> !Rs2Player.isAnimating(), 10000);
-                sleep(300, 600); // Brief pause for log to land in inventory
-            } else {
-                log.warn("No dead tree found — all chopped? Have {} logs", Rs2Inventory.count(ITEM_LOG));
+        // ---- Phase A: collect all 3 logs before touching the bridge ----
+        if (logs < 3) {
+            Rs2TileObjectModel deadTree = findObjectById(OBJ_DEAD_TREE);
+            if (deadTree == null) {
+                log.warn("No dead tree found — have {}/3 logs, waiting...", logs);
                 sleep(1000);
+                return;
             }
-            return;
+            log.info("[Bridge] Chopping tree — have {}/3 logs", logs);
+            deadTree.click("Chop down");
+            sleepUntil(Rs2Player::isAnimating, 3000);
+            sleepUntil(() -> !Rs2Player.isAnimating(), 10000);
+            sleep(400, 700); // wait for log to land in inventory
+            return; // re-enter next tick to re-check count
         }
 
-        // --- Step 2: Use each log on the current bridge stage ---
-        // Stages: 13834 (broken) → 13835 (partially) → 13836 (slightly) → 13837 (fixed)
-        Rs2TileObjectModel bridge = getBrokenBridge();
+        // ---- Phase B: repair bridge with all 3 logs, then cross ----
+        // Determine current bridge stage by checking each ID in order.
+        int currentStage = getBridgeStage();
+        log.info("[Bridge] Have 3 logs. Current bridge stage: {}", bridgeStageName(currentStage));
 
-        if (bridge == null) {
-            // No broken bridge found — check if it's fixed and cross
-            Rs2TileObjectModel fixedBridge = findObjectById(OBJ_FIXED_BRIDGE); // id:13837
+        if (currentStage == 3) {
+            // Bridge is fixed (id:13837) — cross it
+            Rs2TileObjectModel fixedBridge = findObjectById(OBJ_FIXED_BRIDGE);
             if (fixedBridge != null) {
-                log.info("Bridge fixed (id:13837), crossing...");
+                log.info("[Bridge] Crossing fixed bridge (id:13837)...");
                 fixedBridge.click("Cross");
                 sleepUntil(() -> findObjectById(OBJ_FIXED_BRIDGE) == null, 8000);
-                setState(TempleTrekkingState.CONTINUE_TREK);
+                setState(TempleTrekkingState.TREKKING);
             } else {
-                log.warn("No bridge found at all, waiting...");
-                sleep(1000);
+                sleep(500); // fixed bridge not loaded yet, wait
             }
             return;
         }
 
-        log.info("Using log on bridge (id:{})... (repair {})", bridge.getId(), bridgeMaterialsUsed + 1);
+        if (currentStage == -1) {
+            // No bridge object found at all — mid-transition, poll until one appears
+            log.debug("[Bridge] No bridge object visible, waiting for stage update...");
+            sleepUntil(() -> getBridgeStage() != -1, 3000);
+            return;
+        }
+
+        // Apply next log to advance the bridge by one stage
+        Rs2TileObjectModel bridge = findObjectById(bridgeIdForStage(currentStage));
+        if (bridge == null) {
+            sleep(500);
+            return;
+        }
+        log.info("[Bridge] Using log on {} (id:{}) — log {} of 3",
+                bridgeStageName(currentStage), bridge.getId(), currentStage + 1);
         Rs2Inventory.use(ITEM_LOG);
         sleep(300, 500);
         bridge.click();
-
-        // Confirm the repair prompt if it appears
-        boolean dialogueAppeared = sleepUntil(Rs2Dialogue::hasSelectAnOption, 4000);
-        if (dialogueAppeared) {
+        if (sleepUntil(Rs2Dialogue::hasSelectAnOption, 4000)) {
             Rs2Dialogue.clickOption("Yes");
-            sleep(600, 900);
+            sleep(500, 800);
         }
-
-        bridgeMaterialsUsed++;
-        // Wait for the bridge object to update to the next stage (or become fixed)
-        sleepUntil(() -> getBrokenBridge() != null || findObjectById(OBJ_FIXED_BRIDGE) != null, 3000);
-        sleep(400, 700);
+        // Poll until the bridge moves to the next stage (or fixed)
+        int expectedNextStage = currentStage + 1;
+        boolean advanced = sleepUntil(() -> getBridgeStage() >= expectedNextStage, 5000);
+        if (!advanced) {
+            log.warn("[Bridge] Bridge did not advance from stage {} within 5s, retrying...", currentStage);
+        }
+        sleep(300, 500);
     }
 
     // =========================================================================
     // STATE: BRIDGE_KILL_ZOMBIES
     //
-    // Steps:
-    //   1. Kill Undead Lumberjacks (id:5655) until 3 planks (id:960) in inventory
-    //   2. Use Plank → Broken bridge (13834) → Partially (13835) → Slightly (13836)
-    //   3. Cross Fixed bridge (13837)
+    // Same bridge stage IDs as BRIDGE_CHOP_TREES — see stage table above.
+    // Phase A: Kill lumberjacks and loot planks until 3 in inventory.
+    // Phase B: Repair bridge one plank at a time, polling for stage advance.
     // =========================================================================
     private void handleBridgeKillZombies() {
-        // --- Step 1: Kill lumberjacks until we have 3 planks ---
-        if (Rs2Inventory.count(ITEM_PLANK) < 3) {
+        int planks = Rs2Inventory.count(ITEM_PLANK);
 
-            Rs2NpcModel lumberjack = Microbot.getRs2NpcCache().query()
-                    .withId(5655) // Undead Lumberjack — verified ID
-                    .nearest();
-
+        // ---- Phase A: collect all 3 planks before touching the bridge ----
+        if (planks < 3) {
+            Rs2NpcModel lumberjack = Microbot.getRs2NpcCache().query().withId(5655).nearest();
             if (lumberjack != null && !Rs2Player.isInCombat()) {
-                int planksBeforeKill = Rs2Inventory.count(ITEM_PLANK);
-                log.info("Attacking Undead Lumberjack (id:5655)... (have {} planks)", planksBeforeKill);
+                int before = planks;
+                log.info("[Bridge] Attacking lumberjack (id:5655) — have {}/3 planks", before);
                 lumberjack.click("Attack");
                 sleepUntil(Rs2Player::isInCombat, 3000);
                 sleepUntil(() -> !Rs2Player.isInCombat(), 30000);
-                sleep(600, 1000); // Brief pause for loot to land on ground
-
-                // Plank is on the ground — click it to pick up
-                log.info("Lumberjack dead, picking up plank...");
+                sleep(600, 1000);
+                log.info("[Bridge] Lumberjack dead, looting plank...");
                 net.runelite.client.plugins.microbot.util.grounditem.Rs2GroundItem.loot(ITEM_PLANK);
-                // Wait until the plank count increases (confirms pickup)
-                sleepUntil(() -> Rs2Inventory.count(ITEM_PLANK) > planksBeforeKill, 4000);
-                log.info("Planks now: {}/3", Rs2Inventory.count(ITEM_PLANK));
+                sleepUntil(() -> Rs2Inventory.count(ITEM_PLANK) > before, 4000);
+                log.info("[Bridge] Planks: {}/3", Rs2Inventory.count(ITEM_PLANK));
             } else if (lumberjack == null) {
-                log.debug("Waiting for Undead Lumberjack (id:5655) to spawn... (have {} planks)",
-                        Rs2Inventory.count(ITEM_PLANK));
+                log.debug("[Bridge] Waiting for lumberjack to spawn — have {}/3 planks", planks);
                 sleep(1000);
             }
-            // Still in combat — wait it out
             return;
         }
 
-        // --- Step 3: Use each plank on the current bridge stage ---
-        Rs2TileObjectModel bridge = getBrokenBridge();
+        // ---- Phase B: repair bridge with all 3 planks, then cross ----
+        int currentStage = getBridgeStage();
+        log.info("[Bridge] Have 3 planks. Current bridge stage: {}", bridgeStageName(currentStage));
 
-        if (bridge == null) {
-            Rs2TileObjectModel fixedBridge = findObjectById(OBJ_FIXED_BRIDGE); // id:13837
+        if (currentStage == 3) {
+            Rs2TileObjectModel fixedBridge = findObjectById(OBJ_FIXED_BRIDGE);
             if (fixedBridge != null) {
-                log.info("Bridge fixed (id:13837), crossing...");
+                log.info("[Bridge] Crossing fixed bridge (id:13837)...");
                 fixedBridge.click("Cross");
                 sleepUntil(() -> findObjectById(OBJ_FIXED_BRIDGE) == null, 8000);
-                setState(TempleTrekkingState.CONTINUE_TREK);
+                setState(TempleTrekkingState.TREKKING);
             } else {
-                log.warn("No bridge found at all, waiting...");
-                sleep(1000);
+                sleep(500);
             }
             return;
         }
 
-        log.info("Using plank on bridge (id:{})... (repair {})", bridge.getId(), bridgeMaterialsUsed + 1);
+        if (currentStage == -1) {
+            log.debug("[Bridge] No bridge object visible, waiting for stage update...");
+            sleepUntil(() -> getBridgeStage() != -1, 3000);
+            return;
+        }
+
+        Rs2TileObjectModel bridge = findObjectById(bridgeIdForStage(currentStage));
+        if (bridge == null) {
+            sleep(500);
+            return;
+        }
+        log.info("[Bridge] Using plank on {} (id:{}) — plank {} of 3",
+                bridgeStageName(currentStage), bridge.getId(), currentStage + 1);
         Rs2Inventory.use(ITEM_PLANK);
         sleep(300, 500);
         bridge.click();
-
-        boolean dialogueAppeared = sleepUntil(Rs2Dialogue::hasSelectAnOption, 4000);
-        if (dialogueAppeared) {
+        if (sleepUntil(Rs2Dialogue::hasSelectAnOption, 4000)) {
             Rs2Dialogue.clickOption("Yes");
-            sleep(600, 900);
+            sleep(500, 800);
         }
-
-        bridgeMaterialsUsed++;
-        sleepUntil(() -> getBrokenBridge() != null || findObjectById(OBJ_FIXED_BRIDGE) != null, 3000);
-        sleep(400, 700);
+        int expectedNextStage = currentStage + 1;
+        boolean advanced = sleepUntil(() -> getBridgeStage() >= expectedNextStage, 5000);
+        if (!advanced) {
+            log.warn("[Bridge] Bridge did not advance from stage {} within 5s, retrying...", currentStage);
+        }
+        sleep(300, 500);
     }
 
     // =========================================================================
     // STATE: RIVER_CROSSING
     //
-    // Steps:
-    //   1. Cut vine from Swamp tree 3 times (get 3 Short vines id:7778)
-    //   2. Combine 2 Short vines → use one on another (opens combine dialogue)
-    //   3. Combine result with 3rd short vine → Long vine (id:7777)
-    //   4. Use Long vine on Swamp tree branch
-    //   5. Click "Swing-from" Swamp tree branch
+    // Swamp tree IDs (tree tracks remaining vines):
+    //   id:13847 — 3 vines remaining (fresh)
+    //   id:13848 — 2 vines remaining
+    //   id:13849 — 1 vine remaining
+    // After all 3 vines cut, tree disappears. findSwampTree() checks all three.
     // =========================================================================
     private void handleRiverCrossing() {
-        // --- Step 1: Get 3 short vines ---
-        int vineCount = Rs2Inventory.count(ITEM_SHORT_VINE);
-        if (vineCount < 3) {
-            Rs2TileObjectModel swampTree = findObjectById(OBJ_SWAMP_TREE); // id:13847
+        // Step 2 check comes FIRST: if long vine is already in inventory, skip
+        // straight to attaching it. Without this guard, after combining the short
+        // vine count drops to 0 and the cut phase fires again incorrectly.
+        if (!Rs2Inventory.contains(ITEM_LONG_VINE)) {
 
-            if (swampTree == null) {
-                log.warn("No Swamp tree (id:13847) found for vine cutting");
-                sleep(1000);
+            // Step 1: cut short vines until we have 3
+            int vineCount = Rs2Inventory.count(ITEM_SHORT_VINE);
+            if (vineCount < 3) {
+                Rs2TileObjectModel swampTree = findSwampTree();
+                if (swampTree == null) {
+                    log.warn("[River] No swamp tree found (ids:13847/13848/13849) — have {}/3 vines", vineCount);
+                    sleep(1000);
+                    return;
+                }
+                log.info("[River] Cutting vine from tree (id:{}) — have {}/3", swampTree.getId(), vineCount);
+                swampTree.click("Cut-vine");
+                int before = vineCount;
+                sleepUntil(() -> Rs2Inventory.count(ITEM_SHORT_VINE) > before, 5000);
                 return;
             }
 
-            log.info("Cutting vine... (have {}/3)", vineCount);
-            swampTree.click("Cut-vine");
-            int currentCount = vineCount;
-            sleepUntil(() -> Rs2Inventory.count(ITEM_SHORT_VINE) > currentCount, 5000);
-            return;
-        }
-
-        // --- Step 2 & 3: Combine short vines into long vine ---
-        if (!Rs2Inventory.contains(ITEM_LONG_VINE)) {
-            log.info("Combining short vines into long vine...");
+            // Step 2: have 3 short vines — combine into long vine
+            log.info("[River] Combining 3 short vines into long vine...");
             Rs2Inventory.combine(ITEM_SHORT_VINE, ITEM_SHORT_VINE);
             sleepUntil(() -> Rs2Inventory.contains(ITEM_LONG_VINE), 5000);
             return;
         }
 
-        // --- Step 4: Use long vine on bare branch (id:13845) ---
-        // Once the vine is attached, the branch becomes id:13846 which has Swing-from.
-        Rs2TileObjectModel bareBranch = findObjectById(OBJ_SWAMP_TREE_BRANCH_BARE); // id:13845
+        // Step 3: use long vine on bare branch
+        Rs2TileObjectModel bareBranch = findObjectById(OBJ_SWAMP_TREE_BRANCH_BARE);
         if (bareBranch != null) {
             log.info("Using long vine on tree branch (id:13845)...");
             Rs2Inventory.use(ITEM_LONG_VINE);
             sleep(300, 500);
             bareBranch.click();
-            // Wait for the bare branch to be replaced by the vine branch (id:13846)
             sleepUntil(() -> findObjectById(OBJ_SWAMP_TREE_BRANCH_VINE) != null, 5000);
             return;
         }
 
-        // --- Step 5: Swing across from vine branch (id:13846) ---
-        Rs2TileObjectModel vineBranch = findObjectById(OBJ_SWAMP_TREE_BRANCH_VINE); // id:13846
+        // Step 4: swing across
+        Rs2TileObjectModel vineBranch = findObjectById(OBJ_SWAMP_TREE_BRANCH_VINE);
         if (vineBranch != null) {
             log.info("Swinging from vine branch (id:13846)...");
             vineBranch.click("Swing-from");
-            // Wait until the branch disappears (we've crossed)
             sleepUntil(() -> findObjectById(OBJ_SWAMP_TREE_BRANCH_VINE) == null, 8000);
-            setState(TempleTrekkingState.CONTINUE_TREK);
-            return;
-        }
-
-        log.warn("River crossing: no branch found (bare or vine), waiting...");
-        sleep(1000);
-    }
-
-    // =========================================================================
-    // STATE: CONTINUE_TREK
-    //
-    // Called by event handlers after they finish (crossed bridge, swung on vine,
-    // etc.). The Continue-trek path stone is now reachable on the far side.
-    // Click it to load the next event segment, then return to TREKKING.
-    // =========================================================================
-    private void handleContinueTrek() {
-        if (hasRewardToken()) {
-            setState(TempleTrekkingState.TREK_COMPLETE);
-            return;
-        }
-
-        Rs2TileObjectModel continuePath = findObjectWithAction("Continue-trek");
-        if (continuePath == null) {
-            // Stone not visible yet — may be mid-transition, return to TREKKING
-            // to wait for the next event or for the stone to appear
-            log.debug("CONTINUE_TREK: no path stone visible, returning to TREKKING");
             setState(TempleTrekkingState.TREKKING);
             return;
         }
 
-        log.info("Clicking Continue-trek path stone...");
-        continuePath.click("Continue-trek");
-        sleepUntil(() -> findObjectWithAction("Continue-trek") == null, 10000);
-        setState(TempleTrekkingState.TREKKING);
+        log.warn("River crossing: no branch found, waiting...");
+        sleep(1000);
     }
 
     // =========================================================================
     // STATE: TREK_COMPLETE
-    //
-    // Trek finished — increment counter, leave token in inventory, restart.
     // =========================================================================
     private void handleTrekComplete() {
         trekCount++;
-        trekInProgress = false; // Allow START_TREK to find the NPC again
-        log.info("Trek {} complete! Token in inventory. Starting next trek...", trekCount);
-        sleep(2000, 4000); // Human-like pause before starting another
+        trekInProgress = false;
+        log.info("Trek {} complete! Starting next trek...", trekCount);
+        sleep(2000, 4000);
         setState(TempleTrekkingState.START_TREK);
-    }
-
-    // =========================================================================
-    // STATE: UNKNOWN_EVENT
-    //
-    // Unrecognised situation — log and try to recover by re-detecting.
-    // =========================================================================
-    private void handleUnknownEvent() {
-        log.warn("Unknown event state. Waiting 3 seconds before retrying detection...");
-        sleep(3000);
-        setState(TempleTrekkingState.DETECT_EVENT);
     }
 
     // =========================================================================
@@ -709,73 +559,58 @@ public class TempleTrekkingScript extends Script {
     // =========================================================================
 
     /**
-     * Returns the current form of broken bridge present in the scene,
-     * checking all three progressive states.
-     * Returns null if no broken bridge exists (i.e. it's fixed or not a bridge event).
+     * Returns the current bridge repair stage as an integer:
+     *   0 = Broken bridge       (id:13834)
+     *   1 = Partially repaired  (id:13835)
+     *   2 = Almost repaired     (id:13836)
+     *   3 = Fixed bridge        (id:13837)
+     *  -1 = No bridge object visible (mid-transition)
      */
-    private Rs2TileObjectModel getBrokenBridge() {
-        Rs2TileObjectModel bridge = findObjectById(OBJ_BROKEN_BRIDGE);    // id:13834
-        if (bridge != null) return bridge;
-        bridge = findObjectById(OBJ_PARTIALLY_BROKEN);                    // id:13835
-        if (bridge != null) return bridge;
-        return findObjectById(OBJ_SLIGHTLY_BROKEN);                       // id:13836
+    private int getBridgeStage() {
+        if (findObjectById(OBJ_BROKEN_BRIDGE)    != null) return 0;
+        if (findObjectById(OBJ_PARTIALLY_BROKEN) != null) return 1;
+        if (findObjectById(OBJ_SLIGHTLY_BROKEN)  != null) return 2;
+        if (findObjectById(OBJ_FIXED_BRIDGE)     != null) return 3;
+        return -1;
+    }
+
+    /** Maps a bridge stage (0-2) to its object ID. */
+    private int bridgeIdForStage(int stage) {
+        switch (stage) {
+            case 0: return OBJ_BROKEN_BRIDGE;    // id:13834
+            case 1: return OBJ_PARTIALLY_BROKEN; // id:13835
+            case 2: return OBJ_SLIGHTLY_BROKEN;  // id:13836
+            default: return OBJ_FIXED_BRIDGE;    // id:13837
+        }
+    }
+
+    /** Human-readable bridge stage name for logging. */
+    private String bridgeStageName(int stage) {
+        switch (stage) {
+            case 0:  return "Broken (id:13834)";
+            case 1:  return "Partially repaired (id:13835)";
+            case 2:  return "Almost repaired (id:13836)";
+            case 3:  return "Fixed (id:13837)";
+            default: return "Unknown (mid-transition)";
+        }
     }
 
     /**
-     * Finds the nearest tile object matching a given ID.
-     * More reliable than name-based lookup in instanced areas.
-     *
-     * @param id The object ID to search for
-     * @return The nearest matching object, or null if not found
+     * Finds whichever swamp tree variant is currently present.
+     * The tree changes ID as vines are cut: 13847 (3 left) → 13848 (2 left) → 13849 (1 left).
      */
+    private Rs2TileObjectModel findSwampTree() {
+        Rs2TileObjectModel t = findObjectById(OBJ_SWAMP_TREE_3);
+        if (t != null) return t;
+        t = findObjectById(OBJ_SWAMP_TREE_2);
+        if (t != null) return t;
+        return findObjectById(OBJ_SWAMP_TREE_1);
+    }
+
     private Rs2TileObjectModel findObjectById(int id) {
-        return Microbot.getRs2TileObjectCache().query()
-                .withId(id)
-                .nearest();
+        return Microbot.getRs2TileObjectCache().query().withId(id).nearest();
     }
 
-    /**
-     * Finds the nearest tile object matching a given name (case-insensitive).
-     * Uses the new Rs2TileObjectCache — the non-deprecated way to find objects.
-     *
-     * @param name The exact name of the object to find
-     * @return The nearest matching object, or null if not found
-     */
-    private Rs2TileObjectModel findObjectByName(String name) {
-        return Microbot.getRs2TileObjectCache().query()
-                .withName(name)
-                .nearest();
-    }
-
-    /**
-     * Finds the nearest tile object that has a specific right-click action available.
-     * Useful for finding path stones by their "Continue-trek" or "Evade-event" action
-     * since both path types share the same object name "Path".
-     *
-     * @param action The action string to search for (e.g., "Continue-trek")
-     * @return The nearest matching object, or null if not found
-     */
-    private Rs2TileObjectModel findObjectWithAction(String action) {
-        return Microbot.getRs2TileObjectCache().query()
-                .where(obj -> {
-                    // Get the object's composition to check its actions array
-                    var comp = obj.getObjectComposition();
-                    if (comp == null) return false;
-                    String[] actions = comp.getActions();
-                    if (actions == null) return false;
-                    for (String a : actions) {
-                        if (action.equalsIgnoreCase(a)) return true;
-                    }
-                    return false;
-                })
-                .nearest();
-    }
-
-    /**
-     * Dumps all visible tile object names and their actions to the log.
-     * Used to verify our OBJ_* name constants match what the game actually uses.
-     * Safe to leave in permanently — only runs on state entry, not every tick.
-     */
     private void logNearbyObjects() {
         Microbot.getClientThread().invoke(() -> {
             var objects = Microbot.getRs2TileObjectCache().query().toList();
@@ -784,14 +619,13 @@ public class TempleTrekkingScript extends Script {
                 .filter(obj -> obj.getObjectComposition() != null)
                 .forEach(obj -> {
                     var comp = obj.getObjectComposition();
-                    String name = comp.getName();
                     String[] actions = comp.getActions();
                     String actionStr = actions != null
                         ? String.join(", ", java.util.Arrays.stream(actions)
                             .filter(a -> a != null && !a.isEmpty())
                             .toArray(String[]::new))
                         : "none";
-                    log.info("  Object: '{}' | Actions: [{}]", name, actionStr);
+                    log.info("  id:{} name:'{}' actions:[{}]", obj.getId(), comp.getName(), actionStr);
                 });
             log.info("=== End object list ===");
             return null;
@@ -799,17 +633,15 @@ public class TempleTrekkingScript extends Script {
     }
 
     /**
-     * Checks whether a reward token is in the player's inventory.
-     * Checks by name since there are blue/yellow/red variants.
+     * Returns true when the player has arrived at a trek endpoint.
+     * Hiylik Myna (id:1579) only appears at Paterdomus (Temple Trekking end).
+     * Florin (id:4454) only appears at Burgh de Rott (Ramble end).
+     * Neither NPC can appear during an active trek instance.
      */
-    private boolean hasRewardToken() {
-        return Rs2Inventory.contains("Reward token");
+    private boolean isAtEndpoint() {
+        return Microbot.getRs2NpcCache().query().withIds(new int[]{1579, 4454}).nearest() != null;
     }
 
-    /**
-     * Central state transition — all state changes go through here.
-     * Having one place for transitions makes debugging much easier.
-     */
     private void setState(TempleTrekkingState newState) {
         if (currentState != newState) {
             log.info("State: {} → {}", currentState, newState);
@@ -823,8 +655,8 @@ public class TempleTrekkingScript extends Script {
 
     @Override
     public void shutdown() {
-        super.shutdown(); // ALWAYS call this first — cancels the executor
+        super.shutdown();
         currentState = TempleTrekkingState.IDLE;
-        log.info("Temple Trekking script shut down. Total treks this session: {}", trekCount);
+        log.info("Temple Trekking script shut down. Total treks: {}", trekCount);
     }
 }
