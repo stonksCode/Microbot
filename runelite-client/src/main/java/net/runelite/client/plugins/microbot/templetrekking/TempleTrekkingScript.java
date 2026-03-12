@@ -99,6 +99,9 @@ public class TempleTrekkingScript extends Script {
     // Same latch for the zombie bridge — set true once 3 planks confirmed in inventory.
     // Prevents re-entering Phase A (and attacking zombies) once repair has started.
     private boolean planksCollected   = false;
+    // Set true after the player swings across the river. Prevents re-entering
+    // handleRiverCrossing and swinging back while the vine branch is still rendered.
+    private boolean riverCrossed      = false;
 
     // =========================================================================
     // Entry point
@@ -156,10 +159,17 @@ public class TempleTrekkingScript extends Script {
                 .nearest();
 
         if (escortNpc == null) {
-            log.error("No escort NPC found nearby (ids: 1566/1567/1577/1578). " +
-                      "Ensure the player is at a trek start point. Shutting down.");
-            shutdown();
-            return;
+            // NPC may not be rendered yet — the area could still be loading after
+            // the previous trek ended. Wait up to 10s before giving up for this tick.
+            log.debug("No escort NPC visible yet — waiting up to 10s for area to load...");
+            boolean appeared = sleepUntil(() ->
+                Microbot.getRs2NpcCache().query().withIds(ALL_ESCORT_NPC_IDS).nearest() != null,
+                10000);
+            if (!appeared) {
+                log.warn("Escort NPC still not visible after 10s — will retry next tick.");
+                return; // retry next scheduler tick; never shut down
+            }
+            escortNpc = Microbot.getRs2NpcCache().query().withIds(ALL_ESCORT_NPC_IDS).nearest();
         }
 
         log.info("Found escort NPC: {} (id={}). Clicking Escort...", escortNpc.getName(), escortNpc.getId());
@@ -232,12 +242,12 @@ public class TempleTrekkingScript extends Script {
     // =========================================================================
     // STATE: TREKKING
     //
-    // Idle between events. Transition to DETECT_EVENT only when a known puzzle
-    // object is visible. Never look for or interact with the Continue-trek stone.
+    // Idle between events. We actively poll for event objects within each tick
+    // (up to 200ms) rather than waiting a full 600ms between scheduler fires.
+    // Never look for or interact with the Continue-trek stone here.
     // =========================================================================
     private void handleTrekking() {
         // Trek is complete when we are back at the start area with the escort NPC visible.
-        // We do NOT check for reward tokens — they accumulate in inventory intentionally.
         if (trekInProgress && isAtEndpoint()) {
             log.info("Endpoint NPC visible (Hiylik Myna/Florin) — trek complete!");
             trekInProgress = false;
@@ -262,22 +272,24 @@ public class TempleTrekkingScript extends Script {
             return;
         }
 
-        // Detect event areas by their puzzle objects only — never by path stones.
-        // The state machine guarantees we only reach this code from TREKKING state,
-        // meaning we are between events. Once an event handler takes over, handleTrekking()
-        // is never called again until clickContinueTrek() returns us here.
-        boolean bridge    = findObjectById(OBJ_LOG_BRIDGE_BROKEN)    != null
-                         || findObjectById(OBJ_LOG_BRIDGE_PARTIAL)   != null
-                         || findObjectById(OBJ_PLANK_BRIDGE_PARTIAL) != null
-                         || findObjectById(OBJ_PLANK_BRIDGE_ALMOST)  != null;
-        boolean swampTree = findSwampTree() != null;
-        boolean combat    = findObjectById(OBJ_EVADE_PATH) != null;
-
-        if (bridge || swampTree || combat) {
-            log.info("Event area loaded — bridge={} swampTree={} combat={}", bridge, swampTree, combat);
+        // Actively poll for event objects within this tick window — reduces detection
+        // latency vs. waiting for the next 600ms scheduler fire.
+        boolean detected = sleepUntil(this::isEventPresent, 200);
+        if (detected) {
+            log.info("Event area detected — transitioning to DETECT_EVENT");
             setState(TempleTrekkingState.DETECT_EVENT);
         }
         // Otherwise idle — still walking between events
+    }
+
+    /** Returns true if any known event trigger object is visible. */
+    private boolean isEventPresent() {
+        return findObjectById(OBJ_EVADE_PATH)          != null
+            || findObjectById(OBJ_LOG_BRIDGE_BROKEN)   != null
+            || findObjectById(OBJ_LOG_BRIDGE_PARTIAL)  != null
+            || findObjectById(OBJ_PLANK_BRIDGE_PARTIAL) != null
+            || findObjectById(OBJ_PLANK_BRIDGE_ALMOST) != null
+            || findSwampTree()                         != null;
     }
 
     // =========================================================================
@@ -320,7 +332,8 @@ public class TempleTrekkingScript extends Script {
         // River crossing: any swamp tree variant present
         if (findSwampTree() != null) {
             log.info("Detected: River crossing event");
-            vineAttached = false; // Reset vine attachment state for new crossing
+            vineAttached = false;
+            riverCrossed = false; // Reset for fresh crossing
             setState(TempleTrekkingState.RIVER_CROSSING);
             return;
         }
@@ -343,15 +356,21 @@ public class TempleTrekkingScript extends Script {
                 findSwampTree() != null,
                 10000);
         if (!puzzleAppeared) {
-            log.error("DETECT_EVENT: puzzle objects never appeared after 10s. Shutting down.");
+            // Puzzle objects never appeared — most likely a slow scene load or an
+            // event type we don't recognise yet. Log what's around and fall back to
+            // TREKKING so the loop continues rather than dying permanently.
+            log.warn("DETECT_EVENT: puzzle objects never appeared after 10s — falling back to TREKKING.");
             logNearbyObjects();
-            shutdown();
+            setState(TempleTrekkingState.TREKKING);
         }
         // If they appeared, next scheduler tick will re-enter DETECT_EVENT and route correctly.
     }
 
     // =========================================================================
     // STATE: EVADE_COMBAT
+    //
+    // Click the evade path as fast as possible to minimise damage taken.
+    // Retry up to 5 times (3s total) in case the first click misses.
     // =========================================================================
     private void handleEvadeCombat() {
         Rs2TileObjectModel evadePath = findObjectById(OBJ_EVADE_PATH);
@@ -360,9 +379,16 @@ public class TempleTrekkingScript extends Script {
             return;
         }
 
-        log.info("Clicking Evade-event path (id:13831)...");
-        evadePath.click("Evade-event");
-        sleepUntil(() -> findObjectById(OBJ_EVADE_PATH) == null, 10000);
+        log.info("Clicking Evade-event path (id:13831) — evading ASAP...");
+        // Retry loop: click immediately, then re-check every 600ms for up to 5s.
+        for (int attempt = 1; attempt <= 5; attempt++) {
+            evadePath.click("Evade-event");
+            boolean gone = sleepUntil(() -> findObjectById(OBJ_EVADE_PATH) == null, 1000);
+            if (gone) break;
+            log.debug("Evade path still present after attempt {} — retrying", attempt);
+            evadePath = findObjectById(OBJ_EVADE_PATH);
+            if (evadePath == null) break; // disappeared between retry checks
+        }
         setState(TempleTrekkingState.TREKKING);
     }
 
@@ -470,21 +496,24 @@ public class TempleTrekkingScript extends Script {
                     return;
                 }
 
-                // No plank on ground — attack a lumberjack if not already in combat.
-                // This prevents standing idle waiting for zombies to walk over.
+                // No plank on ground — click attack if not already in combat.
+                // Do NOT sleepUntil(isInCombat) — that blocks the ground-plank check
+                // for up to 3s if the zombie is stuck pathing. Instead just fire the
+                // click and immediately return; the next 600ms scheduler tick will
+                // re-check for ground planks first before attacking again.
                 if (!Rs2Player.isInCombat()) {
                     Rs2NpcModel lumberjack = Microbot.getRs2NpcCache().query().withId(5655).nearest();
                     if (lumberjack != null) {
                         log.info("[PlankBridge] Attacking lumberjack (id:5655) — have {}/3 planks", currentCount);
                         lumberjack.click("Attack");
-                        sleepUntil(Rs2Player::isInCombat, 3000);
+                        // No sleepUntil here — return immediately so ground plank
+                        // check fires on the very next tick (~600ms).
                     } else {
-                        log.debug("[PlankBridge] No lumberjack found yet — have {}/3 planks", currentCount);
+                        log.debug("[PlankBridge] No lumberjack in range yet — have {}/3 planks", currentCount);
                     }
                 } else {
                     log.debug("[PlankBridge] In combat, waiting for plank drop — have {}/3 planks", currentCount);
                 }
-                sleep(600);
                 return;
             }
         }
@@ -547,6 +576,14 @@ public class TempleTrekkingScript extends Script {
     // fall backwards once a step is done.
     // =========================================================================
     private void handleRiverCrossing() {
+        // Guard: once the player has swung across, do not re-enter this handler.
+        // The vine branch (id:13846) can still be rendered in the scene after crossing,
+        // which would otherwise trigger another swing back to the starting side.
+        if (riverCrossed) {
+            log.debug("[River] Already crossed — waiting for state transition...");
+            return;
+        }
+
         // The bare branch (id:13845) is present from the start of the event — it is NOT
         // a signal that vines are ready. Only act on it once we have a long vine.
         // Correct sequence:
@@ -556,17 +593,43 @@ public class TempleTrekkingScript extends Script {
         //   4. Swing-from vine branch → clickContinueTrek
 
         // Step 4: vine branch (id:13846) visible — swing across
+        // After the swing lands there is an unskippable NPC cutscene dialogue
+        // followed by a fade-to-black before control returns to the player.
+        // We must NOT click Continue-trek during that window or the click is lost.
+        // Strategy:
+        //   1. Click Swing-from, wait for animation to start then finish (player landed).
+        //   2. Latch riverCrossed immediately.
+        //   3. Wait out the NPC dialogue (hasContinue = true → click through it).
+        //   4. Wait for the fade-to-black to end (player stops being in a dialogue AND
+        //      is no longer animating) before clicking the Continue-trek stone.
         Rs2TileObjectModel vineBranch = findObjectById(OBJ_SWAMP_TREE_BRANCH_VINE);
         if (vineBranch != null) {
             log.info("[River] Vine branch (id:13846) — swinging across...");
             vineBranch.click("Swing-from");
-            boolean swung = sleepUntil(() -> findObjectById(OBJ_SWAMP_TREE_BRANCH_VINE) == null, 8000);
-            if (swung) {
-                log.info("[River] Crossed successfully — clicking Continue-trek...");
-                clickContinueTrek();
-            } else {
-                log.warn("[River] Swing did not complete within 8s, retrying...");
+            sleepUntil(Rs2Player::isAnimating, 3000);         // swing animation starts
+            sleepUntil(() -> !Rs2Player.isAnimating(), 8000); // swing animation finishes (landed)
+            riverCrossed = true; // latch before anything else — branch may still be rendered
+            log.info("[River] Landed. Waiting for post-swing NPC dialogue to clear...");
+
+            // Click through any NPC dialogue that appears after the swing
+            sleepUntil(Rs2Dialogue::isInDialogue, 4000);
+            while (Rs2Dialogue.isInDialogue()) {
+                if (Rs2Dialogue.hasContinue()) {
+                    sleep(400, 700);
+                    Rs2Dialogue.clickContinue();
+                    sleep(500, 800);
+                } else {
+                    sleep(300);
+                }
             }
+
+            // Wait for fade-to-black to end: player not animating + not in dialogue
+            log.info("[River] Dialogue done. Waiting for fade-to-black to clear...");
+            sleepUntil(() -> !Rs2Player.isAnimating() && !Rs2Dialogue.isInDialogue(), 8000);
+            sleep(600, 1000); // brief buffer after fade ends before clicking stone
+
+            log.info("[River] Crossing complete — clicking Continue-trek...");
+            clickContinueTrek();
             return;
         }
 
@@ -587,12 +650,13 @@ public class TempleTrekkingScript extends Script {
         }
 
         // Step 2: have 3 short vines — combine into long vine
+        // Rs2Inventory.combine() selects the first vine, then explicitly finds a DIFFERENT
+        // slot for the second vine and clicks it as the target. This is the correct
+        // "use item on item" pattern — using use() twice just re-selects the same item.
         int vineCount = Rs2Inventory.count(ITEM_SHORT_VINE);
         if (vineCount >= 3) {
-            log.info("[River] Combining 3 short vines into long vine...");
-            Rs2Inventory.use(ITEM_SHORT_VINE);
-            sleep(300, 500);
-            Rs2Inventory.use(ITEM_SHORT_VINE);
+            log.info("[River] Combining short vines into long vine (have {})...", vineCount);
+            Rs2Inventory.combine(ITEM_SHORT_VINE, ITEM_SHORT_VINE);
             sleepUntil(() -> Rs2Inventory.contains(ITEM_LONG_VINE), 5000);
             return;
         }
