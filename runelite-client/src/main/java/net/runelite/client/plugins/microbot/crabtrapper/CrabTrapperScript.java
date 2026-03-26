@@ -38,21 +38,31 @@ public class CrabTrapperScript extends Script {
     // -------------------------------------------------------------------------
     private static final int ITEM_FISH_OFFCUTS  = 11334;
     private static final int ITEM_RED_CRAB      = 31671;
+    private static final int ITEM_BLUE_CRAB     = 31674;
     private static final int ITEM_CRAB_PASTE    = 31708;
     private static final int ITEM_RAW_CRAB_MEAT = 31686;
+    private static final int ITEM_BLUE_CRAB_MEAT = 31695;
     private static final int ITEM_PESTLE        = 233;
     private static final int ITEM_KNIFE         = 946;
 
     private static final WorldPoint BANK_COORD      = new WorldPoint(3039, 3000, 0);
+    // Blue crab trap coordinates (three spots) for BLUE_CRAB mode
+    private static final WorldPoint[] BLUE_TRAP_COORDS = {
+        new WorldPoint(3250, 2432, 0),
+        new WorldPoint(3253, 2431, 0),
+        new WorldPoint(3253, 2433, 0)
+    };
     private static final int        TICK_MS          = 600;
     private static final int        RELAXED_BASE_MS  = 3 * TICK_MS; // 1800ms
     private static final int        RED_CRAB_LVL_REQ = 21;
+    // Placeholder level requirement for BLUE_CRAB; adjust once wiki data is confirmed
+    private static final int        BLUE_CRAB_LVL_REQ = 1;
     private static final int        WALK_DISTANCE    = 3;  // tiles before walking
 
     // -------------------------------------------------------------------------
     // Enums
     // -------------------------------------------------------------------------
-    public enum CrabType      { RED_CRAB }
+    public enum CrabType      { RED_CRAB, BLUE_CRAB }
     public enum InventoryMode { BANK, PASTE, CUT }
     public enum TimingMode    { RELAXED, IMMEDIATE, RANDOM }
 
@@ -124,6 +134,9 @@ public class CrabTrapperScript extends Script {
         sleepUntil(() -> !Rs2Inventory.all().isEmpty(), 10000);
 
         int lvl = Microbot.getClient().getRealSkillLevel(net.runelite.api.Skill.HUNTER);
+        if (crabType == CrabType.BLUE_CRAB && lvl < BLUE_CRAB_LVL_REQ) {
+            stop("Blue crab hunter level too low (" + lvl + "/" + BLUE_CRAB_LVL_REQ + ")"); return;
+        }
         if (lvl < RED_CRAB_LVL_REQ) {
             stop("Hunter level too low (" + lvl + "/" + RED_CRAB_LVL_REQ + ")"); return;
         }
@@ -137,10 +150,16 @@ public class CrabTrapperScript extends Script {
             stop("Cut mode requires a Knife"); return;
         }
 
-        // Confirm at least one of our trap coords has a visible crab trap
+        // Confirm at least one of the active trap coords has a visible crab trap
         boolean anyFound = false;
-        for (WorldPoint coord : MY_TRAP_COORDS) {
+        for (WorldPoint coord : getActiveCoords()) {
             if (getTrapAt(coord) != null) { anyFound = true; break; }
+        }
+        // Blue traps (new coordinates)
+        if (!anyFound) {
+            for (WorldPoint coord : BLUE_TRAP_COORDS) {
+                if (getTrapAt(coord) != null) { anyFound = true; break; }
+            }
         }
         if (!anyFound) {
             stop("No crab traps found — stand near the traps before starting"); return;
@@ -148,8 +167,9 @@ public class CrabTrapperScript extends Script {
 
         if (timingMode == TimingMode.RANDOM) rollTimingBlock();
 
+        int lvlFinal = Microbot.getClient().getRealSkillLevel(net.runelite.api.Skill.HUNTER);
         log(TAG + " Ready. Mode=" + inventoryMode + " Timing=" + timingMode
-                + " MaxTraps=" + getMaxTraps());
+                + " HunterLvl=" + lvlFinal + " MaxTraps=" + getMaxTraps());
         currentState = State.BAIT_TRAPS;
     }
 
@@ -160,6 +180,31 @@ public class CrabTrapperScript extends Script {
     // since the empty trap object keeps the same ID after baiting.
     // -------------------------------------------------------------------------
     private void handleBaitTraps() {
+        // Blue crab trapping (BLUE_CRAB) uses coordinate-based traps with similar bait logic
+        if (crabType == CrabType.BLUE_CRAB) {
+            int baited = 0;
+            for (WorldPoint coord : BLUE_TRAP_COORDS) {
+                Rs2TileObjectModel trap = findBlueEmptyTrapAtCoord(coord);
+                if (trap != null) {
+                    log(TAG + " Baiting blue trap at (" + coord.getX() + "," + coord.getY() + ")");
+                    walkTo(coord);
+                    trap.click("Bait");
+                    boolean animStarted = sleepUntil(
+                            () -> Rs2Player.lastAnimationID != AnimationID.IDLE, 2500);
+                    if (!animStarted) {
+                        log(TAG + " No bait animation for blue trap at " + coord);
+                    } else {
+                        log(TAG + " Blue trap baited at " + coord);
+                        baited++;
+                    }
+                    // Simple small delay after bait
+                    sleep(400, 600);
+                }
+            }
+            log(TAG + " Blue baited traps count: " + baited);
+            currentState = State.WAIT_FOR_FULL;
+            return;
+        }
         // If inventory is full we can't pick up crabs, so there's nothing useful
         // baiting can accomplish — skip ahead to process/bank.
         if (Rs2Inventory.isFull()) {
@@ -223,6 +268,16 @@ public class CrabTrapperScript extends Script {
     private int waitPollCount = 0;
 
     private void handleWaitForFull() {
+        if (crabType == CrabType.BLUE_CRAB) {
+            Rs2TileObjectModel fullBlue = findBlueFullTrap();
+            if (fullBlue != null) {
+                log(TAG + " Blue full trap found at (" + fullBlue.getWorldLocation().getX() + "," + fullBlue.getWorldLocation().getY() + ")");
+                waitPollCount = 0;
+                currentState = State.COLLECT_TRAPS;
+                return;
+            }
+        }
+        // Red trap path remains
         Rs2TileObjectModel full = findFullTrap();
         if (full != null) {
             log(TAG + " Full trap found (id=" + full.getId() + ") after " + waitPollCount + " polls.");
@@ -238,8 +293,9 @@ public class CrabTrapperScript extends Script {
             if (waitPollCount % 5 == 1) { // log every ~3s
                 StringBuilder sb = new StringBuilder();
                 sb.append(TAG).append(" poll#").append(waitPollCount).append(" [");
-                for (int i = 0; i < MY_TRAP_COORDS.length; i++) {
-                    String n = getNameAt(MY_TRAP_COORDS[i]);
+                WorldPoint[] active = getActiveCoords();
+                for (int i = 0; i < active.length; i++) {
+                    String n = getNameAt(active[i]);
                     sb.append(i > 0 ? ", " : "").append(n != null ? n : "null");
                 }
                 sb.append("]");
@@ -298,7 +354,9 @@ public class CrabTrapperScript extends Script {
     // is full for BANK mode. For PASTE/CUT we also allow an early flush when
     // there are no offcuts left and we still have crabs.
     private boolean shouldProcessNow() {
-        int crabCount = Rs2Inventory.count(ITEM_RED_CRAB);
+        int red = Rs2Inventory.count(ITEM_RED_CRAB);
+        int blue = Rs2Inventory.count(ITEM_BLUE_CRAB);
+        int crabCount = red + blue;
         if (crabCount == 0) return false;
         // Always process if inventory is full (can't collect more)
         if (Rs2Inventory.isFull()) return true;
@@ -404,6 +462,9 @@ public class CrabTrapperScript extends Script {
         }
 
         Rs2Bank.depositAll(ITEM_RED_CRAB);
+        // Also deposit blue crabs and their meat if present
+        Rs2Bank.depositAll(ITEM_BLUE_CRAB);
+        Rs2Bank.depositAll(ITEM_BLUE_CRAB_MEAT);
         Rs2Bank.depositAll(ITEM_RAW_CRAB_MEAT);
         sleep(300, 500);
 
@@ -446,12 +507,23 @@ public class CrabTrapperScript extends Script {
     // Our 3 trap spots — hardcoded WorldPoints so we never interact with
     // other players' traps (e.g. 58888 @ 3037,2970 which is nearby but excluded).
     // -------------------------------------------------------------------------
+    // All available trap spots — ordered by preference.
+    // The bot only uses the first getMaxTraps() of these at any given time,
+    // so level-gating is automatic: level 20-39 uses spots [0-1], 40-59 uses [0-2], etc.
     private static final WorldPoint[] MY_TRAP_COORDS = {
         new WorldPoint(3035, 2975, 0),
         new WorldPoint(3037, 2974, 0),
         new WorldPoint(3036, 2972, 0),
     };
     private static final int SPOT_RADIUS = 1; // within 1 tile of each coord
+
+    /** Returns the slice of MY_TRAP_COORDS the bot is allowed to use at the player's current level. */
+    private WorldPoint[] getActiveCoords() {
+        int max = Math.min(getMaxTraps(), MY_TRAP_COORDS.length);
+        WorldPoint[] active = new WorldPoint[max];
+        System.arraycopy(MY_TRAP_COORDS, 0, active, 0, max);
+        return active;
+    }
 
     /**
      * Returns the trap object at the given WorldPoint, or null if none.
@@ -469,6 +541,27 @@ public class CrabTrapperScript extends Script {
         return null;
     }
 
+    /** Blue crab helpers: detect traps by coordinate when BLUE_CRAB is selected. */
+    private Rs2TileObjectModel findBlueEmptyTrapAtCoord(WorldPoint coord) {
+        Rs2TileObjectModel obj = getTrapAt(coord);
+        return (obj != null && obj.getName() != null
+                && obj.getName().toLowerCase().contains("empty")) ? obj : null;
+    }
+
+    private Rs2TileObjectModel findBlueFullTrapAtCoord(WorldPoint coord) {
+        Rs2TileObjectModel obj = getTrapAt(coord);
+        return (obj != null && obj.getName() != null
+                && obj.getName().toLowerCase().contains("full")) ? obj : null;
+    }
+
+    private Rs2TileObjectModel findBlueFullTrap() {
+        for (WorldPoint coord : BLUE_TRAP_COORDS) {
+            Rs2TileObjectModel t = findBlueFullTrapAtCoord(coord);
+            if (t != null) return t;
+        }
+        return null;
+    }
+
     /**
      * Returns the name of the trap at the given coord, or null.
      */
@@ -481,7 +574,7 @@ public class CrabTrapperScript extends Script {
      * Finds the first of MY traps that has the given name.
      */
     private Rs2TileObjectModel findMyTrap(String name) {
-        for (WorldPoint coord : MY_TRAP_COORDS) {
+        for (WorldPoint coord : getActiveCoords()) {
             Rs2TileObjectModel obj = getTrapAt(coord);
             if (obj == null) continue;
             String n = obj.getName();
@@ -503,7 +596,7 @@ public class CrabTrapperScript extends Script {
     /** Counts my traps that are baited or full (active). */
     private int countActive() {
         int count = 0;
-        for (WorldPoint coord : MY_TRAP_COORDS) {
+        for (WorldPoint coord : getActiveCoords()) {
             String name = getNameAt(coord);
             if ("Crab trap (baited)".equalsIgnoreCase(name)
                     || "Crab trap (full)".equalsIgnoreCase(name)) {
