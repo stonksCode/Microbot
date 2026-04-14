@@ -237,7 +237,7 @@ public class Rs2NpcModel extends Rs2ActorModel implements IEntity
             } else {
                 final String finalAction = action;
                 index = IntStream.range(0, actions.length)
-                        .filter(i -> actions[i] != null && actions[i].equalsIgnoreCase(finalAction))
+                        .filter(i -> actions[i] != null && (actions[i].equalsIgnoreCase(finalAction) || actions[i].toLowerCase().startsWith(finalAction.toLowerCase())))
                         .findFirst().orElse(-1);
             }
 

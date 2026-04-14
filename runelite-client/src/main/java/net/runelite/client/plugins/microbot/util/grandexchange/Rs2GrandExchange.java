@@ -208,6 +208,8 @@ public class Rs2GrandExchange {
                 if (request.getQuantity() <= 0) break;
 
                 Rs2Widget.clickWidgetFast(buyOffer);
+                // Give client time to open the offer screen
+                sleep(600, 1000);
                 sleepUntil(GrandExchangeWidget::isOfferTextVisible);
 
 
@@ -243,6 +245,8 @@ public class Rs2GrandExchange {
 
                 if (!Rs2Inventory.interact(request.getItemName(), "Offer", request.isExact())) break;
 
+                // Give client time to open the offer screen after offering item
+                sleep(600, 1000);
                 sleepUntil(GrandExchangeWidget::isOfferTextVisible);
 
                 if (request.getPrice() > 0) {
@@ -272,23 +276,63 @@ public class Rs2GrandExchange {
 
     /**
      * Searches for an item name in the Grand Exchange search box and selects it from the results.
+     * Types characters incrementally and stops early if the item appears in search results
+     * during typing (more natural, bot-resistant behavior).
      * @param request
      * @param searchName
-     * @return
+     * @return true if the search failed, false if an item was successfully selected
      */
     private static boolean searchItemName(GrandExchangeRequest request, String searchName) {
         if (searchName.length() >= 26) {
             searchName = searchName.substring(0, 25); // Grand Exchange item names are limited to 25 characters.
         }
-        Rs2Keyboard.typeString(request.getItemName());
 
-        if (!Rs2Widget.sleepUntilHasWidgetText(searchName, 162, 44, false, 5000)) return true;
+        // Click the search text input field to give it keyboard focus
+        boolean clickedInput = Rs2Widget.clickWidget(162, 44);
+        if (!clickedInput) {
+            log.warn("[GE] Failed to click search input field");
+            return true;
+        }
+        sleep(500, 800);
 
-        sleepUntil(() -> getSearchResultWidget(request.getItemName(), request.isExact()) != null, 2200);
+        // Type characters incrementally, checking for search results after each one
+        String typedSoFar = "";
+        String targetName = searchName.toLowerCase();
 
-        Pair<Widget, Integer> itemResult = getSearchResultWidget(request.getItemName(), request.isExact());
-        if (itemResult == null) return true;
+        for (int i = 0; i < searchName.length(); i++) {
+            char c = searchName.charAt(i);
+            typedSoFar += c;
 
+            // Type single character
+            Rs2Keyboard.typeString(String.valueOf(c));
+
+            // Wait a moment for the search to update
+            sleep(300, 600);
+
+            // During typing, use fuzzy match since we haven't typed the full name yet
+            // After typing completes, switch to the requested exact/partial match
+            boolean useFuzzyDuringTyping = (i < searchName.length() - 1);
+            Pair<Widget, Integer> result = getSearchResultWidget(typedSoFar, useFuzzyDuringTyping);
+            if (result != null) {
+                // Found it — stop typing early and select it
+                log.info("[GE] Found item after typing '{}' — selecting early", typedSoFar);
+                sleep(200, 400);
+                Rs2Widget.clickWidgetFast(result.getLeft(), result.getRight(), 1);
+                return false;
+            }
+        }
+
+        // Full name typed — give the client a moment to finalize results
+        sleep(1000, 2000);
+
+        // Try to find the result with the original exact/partial setting
+        Pair<Widget, Integer> itemResult = getSearchResultWidget(searchName, request.isExact());
+        if (itemResult == null) {
+            log.warn("[GE] Could not find search result widget for '{}' after typing full name", searchName);
+            return true;
+        }
+
+        sleep(200, 400);
         Rs2Widget.clickWidgetFast(itemResult.getLeft(), itemResult.getRight(), 1);
         return false;
     }

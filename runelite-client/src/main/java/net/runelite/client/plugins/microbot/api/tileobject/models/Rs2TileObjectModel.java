@@ -252,7 +252,9 @@ public class Rs2TileObjectModel implements TileObject, IEntity {
 
                 for (int i = 0; i < actions.length; i++) {
                     if (actions[i] == null) continue;
-                    if (action.equalsIgnoreCase(Rs2UiHelper.stripColTags(actions[i]))) {
+                    String strippedAction = Rs2UiHelper.stripColTags(actions[i]);
+                    // Use startsWith to support crop-specific actions like "Harvest Watermelons"
+                    if (action.equalsIgnoreCase(strippedAction) || strippedAction.toLowerCase().startsWith(action.toLowerCase())) {
                         index = i;
                         break;
                     }
