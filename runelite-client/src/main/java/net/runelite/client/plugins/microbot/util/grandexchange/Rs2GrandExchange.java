@@ -202,36 +202,69 @@ public class Rs2GrandExchange {
                 break;
 
             case BUY:
+                // First ensure we're on the buy tab (GE might open on sell tab)
+                ensureBuyTab();
+
                 Widget buyOffer = GrandExchangeWidget.getOfferBuyButton(
                         request.getSlot() != null ? request.getSlot() : getAvailableSlot());
-                if (buyOffer == null) break;
+                if (buyOffer == null) {
+                    log.warn("[GE] Could not find buy button widget for slot {}", request.getSlot());
+                    break;
+                }
                 if (request.getQuantity() <= 0) break;
 
+                log.info("[GE] Clicking buy button for slot {}...",
+                    request.getSlot() != null ? request.getSlot() : "auto");
                 Rs2Widget.clickWidgetFast(buyOffer);
                 // Give client time to open the offer screen
                 sleep(600, 1000);
                 sleepUntil(GrandExchangeWidget::isOfferTextVisible);
 
-
-                Rs2Widget.sleepUntilHasWidgetText("Start typing the name of an item to search for it", 162, 52, false, 5000);
+                // Verify the search prompt is visible before proceeding
+                boolean promptVisible = Rs2Widget.sleepUntilHasWidgetText("Start typing the name of an item to search for it", 162, 52, false, 5000);
+                if (!promptVisible) {
+                    log.warn("[GE] Search prompt never appeared — offer screen may not be ready or slot may have existing offer");
+                    // Go back to slots overview so next attempt starts clean
+                    if (isOfferScreenOpen()) {
+                        backToOverview();
+                        sleep(800);
+                    }
+                    break;
+                }
+                sleep(300, 600);
 
                 String searchName = request.getItemName();
+                log.info("[GE] Offer screen ready, searching for '{}'", searchName);
+
                 boolean itemMatchedWithPreviousSearch = isPreviousSearchMatch(request.getItemName());
                 if (itemMatchedWithPreviousSearch) {
                     var clickedPreviousSearch = clickPreviousSearch();
                     if (!clickedPreviousSearch) break;
                 } else {
-                    if (searchItemName(request, searchName)) break;
+                    if (searchItemName(request, searchName)) {
+                        // Search failed - go back to overview
+                        if (isOfferScreenOpen()) {
+                            backToOverview();
+                            sleep(500);
+                        }
+                        break;
+                    }
                 }
 
+                log.info("[GE] Item selected, waiting for price/quantity screen...");
                 sleepUntil(() -> GrandExchangeWidget.getPricePerItemButton_X() != null);
+                sleep(300, 500);
 
                 setPrice(request.getPrice());
                 if (request.getPercent() != 0) {
                     adjustPriceByPercent(request.getPercent());
                 }
                 if (!setQuantity(request.getQuantity())) {
-                    //failed to set quantity
+                    //failed to set quantity - go back
+                    if (isOfferScreenOpen()) {
+                        backToOverview();
+                        sleep(500);
+                    }
                     return false;
                 }
                 confirm();
@@ -287,51 +320,86 @@ public class Rs2GrandExchange {
             searchName = searchName.substring(0, 25); // Grand Exchange item names are limited to 25 characters.
         }
 
-        // Click the search text input field to give it keyboard focus
-        boolean clickedInput = Rs2Widget.clickWidget(162, 44);
-        if (!clickedInput) {
-            log.warn("[GE] Failed to click search input field");
+        // Verify the offer screen is actually open before we start typing
+        if (!isOfferScreenOpen()) {
+            log.warn("[GE] Offer screen not open when trying to search for '{}'", searchName);
             return true;
         }
-        sleep(500, 800);
 
-        // Type characters incrementally, checking for search results after each one
+        // Clear any existing search text first by clicking the search box
+        // This ensures we start fresh
+        Widget searchBox = Rs2Widget.getWidget(162, 44);
+        if (searchBox == null) {
+            log.warn("[GE] Search box widget (162,44) not found");
+            // Try alternative widget IDs
+            searchBox = Rs2Widget.getWidget(162, 52);
+            if (searchBox == null) {
+                log.warn("[GE] Alternative search box widget (162,52) also not found");
+                return true;
+            }
+        }
+
+        log.info("[GE] Found search box widget, clicking to focus...");
+        boolean clickedInput = Rs2Widget.clickWidget(searchBox);
+        if (!clickedInput) {
+            log.warn("[GE] Failed to click search input widget");
+            return true;
+        }
+        
+        // Wait for the search box to be focused
+        sleep(1000, 1500);
+
+        // Type characters incrementally, checking for search results after each character
         String typedSoFar = "";
-        String targetName = searchName.toLowerCase();
 
         for (int i = 0; i < searchName.length(); i++) {
             char c = searchName.charAt(i);
             typedSoFar += c;
 
-            // Type single character
+            log.info("[GE] Typing character '{}' (typed so far: '{}')", c, typedSoFar);
+            
+            // Type single character with focus check
             Rs2Keyboard.typeString(String.valueOf(c));
 
-            // Wait a moment for the search to update
-            sleep(300, 600);
+            // Wait for the search to update after each character
+            sleep(400, 600);
 
-            // During typing, use fuzzy match since we haven't typed the full name yet
-            // After typing completes, switch to the requested exact/partial match
-            boolean useFuzzyDuringTyping = (i < searchName.length() - 1);
-            Pair<Widget, Integer> result = getSearchResultWidget(typedSoFar, useFuzzyDuringTyping);
-            if (result != null) {
-                // Found it — stop typing early and select it
-                log.info("[GE] Found item after typing '{}' — selecting early", typedSoFar);
-                sleep(200, 400);
-                Rs2Widget.clickWidgetFast(result.getLeft(), result.getRight(), 1);
-                return false;
+            // After at least 3 characters typed, try to find the item
+            if (typedSoFar.length() >= 3) {
+                log.info("[GE] Checking for results containing '{}'", typedSoFar);
+                // Use fuzzy (contains) matching while typing — the GE search narrows as we type
+                Pair<Widget, Integer> result = getSearchResultWidget(typedSoFar, false);
+                if (result != null) {
+                    Widget resultWidget = result.getLeft();
+                    String widgetText = resultWidget != null ? resultWidget.getText() : "null";
+                    log.info("[GE] Found match after typing '{}' — widget text: '{}'", typedSoFar, widgetText);
+                    sleep(300, 600);
+                    Rs2Widget.clickWidgetFast(result.getLeft(), result.getRight(), 1);
+                    return false;
+                } else {
+                    log.info("[GE] No results found for '{}' yet", typedSoFar);
+                }
             }
         }
 
-        // Full name typed — give the client a moment to finalize results
-        sleep(1000, 2000);
+        // Full name typed — give the client time to finalize results
+        sleep(1000, 1500);
 
-        // Try to find the result with the original exact/partial setting
-        Pair<Widget, Integer> itemResult = getSearchResultWidget(searchName, request.isExact());
+        // Final attempt: try both fuzzy and exact matching
+        log.info("[GE] Final search attempt for full name '{}'", searchName);
+        Pair<Widget, Integer> itemResult = getSearchResultWidget(searchName, false);
         if (itemResult == null) {
-            log.warn("[GE] Could not find search result widget for '{}' after typing full name", searchName);
+            // Try exact match as last resort
+            itemResult = getSearchResultWidget(searchName, true);
+        }
+
+        if (itemResult == null) {
+            log.warn("[GE] Could not find search result widget for '{}' after typing full name '{}'",
+                request.getItemName(), searchName);
             return true;
         }
 
+        log.info("[GE] Found '{}' on final check — selecting", searchName);
         sleep(200, 400);
         Rs2Widget.clickWidgetFast(itemResult.getLeft(), itemResult.getRight(), 1);
         return false;
@@ -396,6 +464,29 @@ public class Rs2GrandExchange {
                 return true;
             default:
                 return false;
+        }
+    }
+
+    /**
+     * Ensures the GE is on the Buy tab. If already on the buy tab, does nothing.
+     * If on the sell tab, clicks the buy tab widget.
+     */
+    private static void ensureBuyTab() {
+        // Check if buy buttons are already visible (we're on the buy tab)
+        Widget buyBtn = GrandExchangeWidget.getOfferBuyButton(GrandExchangeSlots.ONE);
+        if (buyBtn != null) {
+            return; // Already on buy tab
+        }
+
+        // Try to find and click the buy tab
+        // The GE buy tab is typically at widget 465, 3 (child 3 of GE_OFFERS interface)
+        Widget buyTab = Rs2Widget.getWidget(465, 3);
+        if (buyTab != null) {
+            log.info("[GE] Switching to Buy tab");
+            Rs2Widget.clickWidget(buyTab);
+            sleep(600, 1000);
+        } else {
+            log.warn("[GE] Could not find buy tab widget - may already be on buy tab or widget ID changed");
         }
     }
 

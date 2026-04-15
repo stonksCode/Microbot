@@ -14,24 +14,35 @@ public interface GeFlipperConfig extends Config {
     @ConfigSection(name = "Advanced", description = "Advanced flipping settings", position = 2)
     String advancedSection = "advancedSection";
 
-    // === Strategy Section ===
+    // ── Strategy Section ──────────────────────────────────────────────────
 
     @ConfigItem(
         keyName = "flipMode",
         name = "Flip Mode",
-        description = "How to select items to flip",
+        description = "How to select and score items to flip",
         position = 0,
         section = strategySection
     )
     default FlipMode flipMode() {
-        return FlipMode.HIGH_VOLUME;
+        return FlipMode.BALANCED;
+    }
+
+    @ConfigItem(
+        keyName = "customItemList",
+        name = "Custom Item List",
+        description = "Comma-separated item names to flip (only used when Flip Mode = Custom List)",
+        position = 1,
+        section = strategySection
+    )
+    default String customItemList() {
+        return "";
     }
 
     @ConfigItem(
         keyName = "minProfitMargin",
         name = "Min Profit Margin (%)",
         description = "Minimum profit margin percentage to consider an item worth flipping",
-        position = 1,
+        position = 2,
         section = strategySection
     )
     @Range(min = 1, max = 50)
@@ -43,7 +54,7 @@ public interface GeFlipperConfig extends Config {
         keyName = "maxInvestmentPerSlot",
         name = "Max Investment Per Slot",
         description = "Maximum coins to invest in a single GE slot (0 = unlimited)",
-        position = 2,
+        position = 3,
         section = strategySection
     )
     @Range(min = 0)
@@ -55,7 +66,7 @@ public interface GeFlipperConfig extends Config {
         keyName = "slotCount",
         name = "Active Slots",
         description = "Number of GE slots to use for flipping (1-8)",
-        position = 3,
+        position = 4,
         section = strategySection
     )
     @Range(min = 1, max = 8)
@@ -63,16 +74,16 @@ public interface GeFlipperConfig extends Config {
         return 8;
     }
 
-    // === Filter Section ===
+    // ── Filter Section ────────────────────────────────────────────────────
 
     @ConfigItem(
         keyName = "minVolume",
         name = "Min Volume (4h)",
-        description = "Minimum trade volume per 4 hours to consider an item",
+        description = "Minimum estimated trade volume per 4 hours — low-volume items are skipped",
         position = 10,
         section = filterSection
     )
-    @Range(min = 1)
+    @Range(min = 0)
     default int minVolume() {
         return 100;
     }
@@ -80,7 +91,7 @@ public interface GeFlipperConfig extends Config {
     @ConfigItem(
         keyName = "maxTradeLimit",
         name = "Max Trade Limit",
-        description = "Maximum GE buy limit per 4h (0 = no limit, include all items)",
+        description = "Skip items whose GE buy limit exceeds this (0 = no cap — include all items)",
         position = 11,
         section = filterSection
     )
@@ -92,7 +103,7 @@ public interface GeFlipperConfig extends Config {
     @ConfigItem(
         keyName = "includeMembersItems",
         name = "Members Items",
-        description = "Whether to include members-only items in flips",
+        description = "Whether to include members-only items",
         position = 12,
         section = filterSection
     )
@@ -103,7 +114,7 @@ public interface GeFlipperConfig extends Config {
     @ConfigItem(
         keyName = "itemBlacklist",
         name = "Item Blacklist",
-        description = "Comma-separated list of item names to never flip",
+        description = "Comma-separated item names to never flip (case-insensitive)",
         position = 13,
         section = filterSection
     )
@@ -111,12 +122,12 @@ public interface GeFlipperConfig extends Config {
         return "";
     }
 
-    // === Advanced Section ===
+    // ── Advanced Section ──────────────────────────────────────────────────
 
     @ConfigItem(
         keyName = "buyPriceOffset",
         name = "Buy Price Offset (%)",
-        description = "How much above low price to place buy offers (higher = faster fills)",
+        description = "How much above the low price to place buy offers (higher = faster fills)",
         position = 20,
         section = advancedSection
     )
@@ -128,7 +139,7 @@ public interface GeFlipperConfig extends Config {
     @ConfigItem(
         keyName = "sellPriceOffset",
         name = "Sell Price Offset (%)",
-        description = "How much below high price to place sell offers (higher = faster sells)",
+        description = "How much below the high price to place sell offers (higher = faster sells)",
         position = 21,
         section = advancedSection
     )
@@ -140,7 +151,7 @@ public interface GeFlipperConfig extends Config {
     @ConfigItem(
         keyName = "refreshIntervalMinutes",
         name = "Scan Interval (min)",
-        description = "How often to re-scan the market for better flip opportunities (1-60)",
+        description = "How often to re-scan the market for flip opportunities",
         position = 22,
         section = advancedSection
     )
@@ -152,7 +163,7 @@ public interface GeFlipperConfig extends Config {
     @ConfigItem(
         keyName = "cancelUndercutOffers",
         name = "Cancel Unprofitable Offers",
-        description = "Cancel buy/sell offers if the market price moves and the flip is no longer profitable",
+        description = "Cancel buy/sell offers if the market moves and the flip is no longer profitable",
         position = 23,
         section = advancedSection
     )
@@ -163,7 +174,7 @@ public interface GeFlipperConfig extends Config {
     @ConfigItem(
         keyName = "offerTimeoutMinutes",
         name = "Offer Timeout (min)",
-        description = "Cancel buy offers that haven't filled after this many minutes (0 = never cancel)",
+        description = "Cancel buy offers that haven't filled after this many minutes (0 = never)",
         position = 24,
         section = advancedSection
     )
@@ -175,7 +186,7 @@ public interface GeFlipperConfig extends Config {
     @ConfigItem(
         keyName = "priceRecheckSeconds",
         name = "Price Re-check (sec)",
-        description = "How often to re-check market prices on active offers (15-300)",
+        description = "How often to re-check market prices on active offers",
         position = 25,
         section = advancedSection
     )
@@ -193,5 +204,17 @@ public interface GeFlipperConfig extends Config {
     )
     default boolean collectToBank() {
         return true;
+    }
+
+    @ConfigItem(
+        keyName = "timeseriesCandidateLimit",
+        name = "Timeseries Scan Limit",
+        description = "Max number of candidate items to run full timeseries analysis on (higher = slower scan but more data)",
+        position = 27,
+        section = advancedSection
+    )
+    @Range(min = 5, max = 100)
+    default int timeseriesCandidateLimit() {
+        return 30;
     }
 }

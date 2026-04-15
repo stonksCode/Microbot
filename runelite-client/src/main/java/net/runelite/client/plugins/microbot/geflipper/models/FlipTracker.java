@@ -3,128 +3,103 @@ package net.runelite.client.plugins.microbot.geflipper.models;
 import net.runelite.client.plugins.microbot.util.grandexchange.GrandExchangeSlots;
 
 /**
- * Tracks an active flip opportunity in a GE slot.
- * Monitors buy/sell offers, quantities, and committed GP.
+ * Tracks an active flip in a single GE slot.
  */
 public class FlipTracker {
     public final int itemId;
     public final String itemName;
     public final GrandExchangeSlots slot;
 
-    // Offer details (immutable once set)
+    // Offer prices / quantity (immutable once placed)
     public final int buyPrice;
     public final int sellPrice;
     public final int totalQuantity;
 
-    // Mutable progress tracking
+    // Progress counters (mutable)
     public int quantityBought;
     public int quantitySold;
 
-    // State tracking
+    // State
     public final long startTime;
     public FlipState state;
 
     public FlipTracker(int itemId, String itemName, GrandExchangeSlots slot,
                        int buyPrice, int sellPrice, int totalQuantity) {
-        this.itemId = itemId;
-        this.itemName = itemName;
-        this.slot = slot;
-        this.buyPrice = buyPrice;
-        this.sellPrice = sellPrice;
+        this.itemId        = itemId;
+        this.itemName      = itemName;
+        this.slot          = slot;
+        this.buyPrice      = buyPrice;
+        this.sellPrice     = sellPrice;
         this.totalQuantity = totalQuantity;
         this.quantityBought = 0;
-        this.quantitySold = 0;
-        this.startTime = System.currentTimeMillis();
-        this.state = FlipState.BUYING;
+        this.quantitySold   = 0;
+        this.startTime     = System.currentTimeMillis();
+        this.state         = FlipState.BUYING;
     }
 
-    /**
-     * Called when a buy offer completes (BOUGHT state detected).
-     * Records the actual quantity bought from the GE offer data.
-     */
     public void updateBought(int quantityBought, int totalQuantity) {
         this.quantityBought = quantityBought;
-        if (totalQuantity > 0) {
-            // Update totalQuantity if GE partially filled differently than requested
-        }
     }
 
-    /**
-     * Called when a sell offer progresses or completes.
-     */
     public void updateSold(int quantitySold) {
         this.quantitySold = quantitySold;
     }
 
     /**
-     * Returns the GP currently committed to this flip's active buy order.
-     * 0 once items are bought (coins are gone, items are in inventory/bank).
+     * Returns the GP that is currently locked inside an active buy order.
+     *
+     * FIXED: while BUYING we reserve the FULL order cost (totalQuantity * buyPrice),
+     * not just the partial quantity received so far.  This prevents the budget tracker
+     * from double-counting "free" GP and placing buy orders we can't actually afford.
+     *
+     * Once the order transitions to BOUGHT/SELLING/COMPLETED the coins are spent;
+     * GP returns when the sell completes and we collect.
      */
     public int getCommittedGP() {
         if (state == FlipState.BUYING) {
-            return quantityBought * buyPrice;
+            // Reserve the full order value — coins are still committed in the GE offer
+            return (long) totalQuantity * buyPrice > Integer.MAX_VALUE
+                    ? Integer.MAX_VALUE
+                    : totalQuantity * buyPrice;
         }
-        // BOUGHT/SELLING/SOLD/COMPLETED: no coins committed, items in inventory
+        // BOUGHT / SELLING / SOLD / COMPLETED: coins are gone, items are in inventory/bank
         return 0;
     }
 
-    /**
-     * Calculates the potential profit if all bought items are sold at the target price.
-     */
+    /** Potential profit assuming all items sell at the target sell price. */
     public int getPotentialProfit() {
-        int potentialRevenue = quantityBought * sellPrice;
-        int cost = quantityBought * buyPrice;
-        return potentialRevenue - cost;
+        return (int) Math.min(Integer.MAX_VALUE,
+                (long) quantityBought * sellPrice - (long) quantityBought * buyPrice);
     }
 
-    /**
-     * Returns the fill percentage of the buy offer.
-     */
     public double getBuyFillPercent() {
         return totalQuantity > 0 ? (double) quantityBought / totalQuantity * 100.0 : 0.0;
     }
 
-    /**
-     * Returns the fill percentage of the sell offer.
-     */
     public double getSellFillPercent() {
         return totalQuantity > 0 ? (double) quantitySold / totalQuantity * 100.0 : 0.0;
     }
 
-    /**
-     * Returns how long this flip has been active in milliseconds.
-     */
     public long getElapsedTime() {
         return System.currentTimeMillis() - startTime;
     }
 
-    /**
-     * Returns true if the buy phase is complete and we're selling.
-     */
     public boolean isSelling() {
         return state == FlipState.SELLING || state == FlipState.SOLD;
     }
 
-    /**
-     * Returns true if the entire flip cycle is complete.
-     */
     public boolean isComplete() {
         return state == FlipState.COMPLETED;
     }
 
     public enum FlipState {
-        BUYING,
-        BOUGHT,
-        SELLING,
-        SOLD,
-        COMPLETED,
-        CANCELLED
+        BUYING, BOUGHT, SELLING, SOLD, COMPLETED, CANCELLED
     }
 
     @Override
     public String toString() {
-        return String.format("Flip[%s in slot %s: %d/%d bought, %d/%d sold, profit=%d]",
-            itemName, slot, quantityBought, totalQuantity,
-            quantitySold, totalQuantity, getPotentialProfit());
+        return String.format("Flip[%s | slot=%s | %d/%d bought | %d/%d sold | profit=%d]",
+                itemName, slot, quantityBought, totalQuantity,
+                quantitySold, totalQuantity, getPotentialProfit());
     }
 }

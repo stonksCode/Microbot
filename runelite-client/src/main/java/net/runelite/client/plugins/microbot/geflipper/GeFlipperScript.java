@@ -1,9 +1,5 @@
 package net.runelite.client.plugins.microbot.geflipper;
 
-import com.google.gson.JsonArray;
-import com.google.gson.JsonElement;
-import com.google.gson.JsonObject;
-import com.google.gson.JsonParser;
 import lombok.extern.slf4j.Slf4j;
 import net.runelite.api.GrandExchangeOffer;
 import net.runelite.api.GrandExchangeOfferState;
@@ -16,17 +12,11 @@ import net.runelite.client.plugins.microbot.util.grandexchange.GrandExchangeSlot
 import net.runelite.client.plugins.microbot.util.grandexchange.Rs2GrandExchange;
 import net.runelite.client.plugins.microbot.util.grandexchange.models.ItemMappingData;
 import net.runelite.client.plugins.microbot.util.grandexchange.models.TimeSeriesAnalysis;
-import net.runelite.client.plugins.microbot.util.grandexchange.models.TimeSeriesDataPoint;
-import net.runelite.client.plugins.microbot.util.grandexchange.models.TimeSeriesInterval;
 import net.runelite.client.plugins.microbot.util.inventory.Rs2Inventory;
 import net.runelite.client.plugins.microbot.util.inventory.Rs2ItemModel;
 import net.runelite.client.plugins.microbot.geflipper.models.FlipAnalysis;
 import net.runelite.client.plugins.microbot.geflipper.models.FlipTracker;
 
-import java.net.http.HttpClient;
-import java.net.http.HttpRequest;
-import java.net.http.HttpResponse;
-import java.time.Duration;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
@@ -35,84 +25,70 @@ import java.util.stream.Collectors;
 
 /**
  * Grand Exchange Flipping Script.
- * Automatically scans for profitable flip opportunities, places buy/sell offers,
- * monitors active offers for price changes, and cancels unprofitable offers.
  *
- * API Strategy:
- *   - /latest (bulk, all items) every 5 minutes — real-time buy/sell prices
- *   - /mapping (bulk, all items) every 30 minutes — item metadata, rarely changes
- *   - /timeseries (per-item) only for top 50 candidates after initial filter
+ * Automatically scans for profitable flip opportunities via the OSRS Wiki Prices API,
+ * places buy/sell offers, monitors active offers, and cancels unprofitable ones.
+ *
+ * All API calls are delegated to {@link WikiPriceClient}, which handles rate-limiting,
+ * caching, retries and exponential back-off so this script never hammers the API.
  */
 @Slf4j
 public class GeFlipperScript extends Script {
 
+    private static final String PLUGIN_VERSION = "2.1";
+    private static final int COINS_ITEM_ID = 995;
+
     private GeFlipperConfig config;
-    // Thread-safe collections: modified on script thread, read on client thread (overlay)
+    private WikiPriceClient wikiClient;
+
+    // Thread-safe: modified on script thread, read on client thread (overlay)
     private final Map<GrandExchangeSlots, FlipTracker> activeFlips = new ConcurrentHashMap<>();
     private final List<FlipAnalysis> analyzedItems = new CopyOnWriteArrayList<>();
 
-    // Profit tracking — use long to prevent overflow
+    // Session stats
     private long sessionStartTime;
     private long sessionTotalProfit;
-    private int sessionFlipsCompleted;
+    private int  sessionFlipsCompleted;
 
-    // Dynamic budget tracking (inventory coins only)
-    private int inventoryGP;
-    private long lastBudgetCheck;
-    private static final int COINS_ITEM_ID = 995;
+    // GP budget (inventory coins only)
+    private int  inventoryGP;
+    private long lastBudgetCheckMs;
 
-    // API caching state
-    private Map<Integer, ItemMappingData> cachedItemMapping = new HashMap<>();
-    private Map<Integer, int[]> cachedLatestPrices = new HashMap<>(); // itemId -> [high, low]
-    private long lastMappingFetch = 0;
-    private long lastFullScan = 0;
-    private long lastPriceRecheck = 0;
-    private static final long MAPPING_CACHE_DURATION = 30 * 60 * 1000; // 30 min (rarely changes)
-    private static final int TIMESERIES_CANDIDATE_LIMIT = 50; // Only fetch timeseries for top 50
+    // Loop timing
+    private long lastFullScanMs;
+    private long lastPriceRecheckMs;
 
-    // API User-Agent (required by OSRS Wiki API)
-    private static final String API_USER_AGENT = "Microbot-GE-Flipper/2.0";
-    private static final String WIKI_LATEST_URL = "https://prices.runescape.wiki/api/v1/osrs/latest";
-    private static final String WIKI_MAPPING_URL = "https://prices.runescape.wiki/api/v1/osrs/mapping";
-    private static final String WIKI_TIMESERIES_URL = "https://prices.runescape.wiki/api/v1/osrs/timeseries";
-
-    // Shared HTTP client with timeout
-    private static final HttpClient HTTP_CLIENT = HttpClient.newBuilder()
-        .connectTimeout(Duration.ofSeconds(15))
-        .build();
-
-    // Helper for SLF4J-compatible number formatting
-    private static String fmt(int n) { return String.format("%,d", n); }
+    // ── Helpers ────────────────────────────────────────────────────────────
+    private static String fmt(int n)  { return String.format("%,d", n); }
     private static String fmt(long n) { return String.format("%,d", n); }
 
-    /**
-     * Main run method called by the plugin.
-     */
+    // ════════════════════════════════════════════════════════════════════════
+    // STARTUP / SHUTDOWN
+    // ════════════════════════════════════════════════════════════════════════
+
     public boolean run(GeFlipperConfig config) {
         this.config = Objects.requireNonNull(config, "config must not be null");
+        this.wikiClient = new WikiPriceClient(PLUGIN_VERSION);
         this.sessionStartTime = System.currentTimeMillis();
         this.sessionTotalProfit = 0;
         this.sessionFlipsCompleted = 0;
         this.inventoryGP = 0;
-        this.lastBudgetCheck = 0;
-        this.lastFullScan = 0;
-        this.lastMappingFetch = 0;
-        this.lastPriceRecheck = 0;
+        this.lastBudgetCheckMs = 0;
+        this.lastFullScanMs = 0;
+        this.lastPriceRecheckMs = 0;
 
         refreshInventoryGP();
-
-        // Reconcile any existing GE offers before starting the loop
         reconcileExistingOffers();
 
         log.info("========================================");
-        log.info("  GE FLIPPER STARTED (v2.0)");
-        log.info("  Mode: {}", config.flipMode());
-        log.info("  Min Profit Margin: {}%", config.minProfitMargin());
+        log.info("  GE FLIPPER STARTED (v{})", PLUGIN_VERSION);
+        log.info("  Mode       : {}", config.flipMode());
+        log.info("  Min Margin : {}%", config.minProfitMargin());
+        log.info("  Min Volume : {} per 4h", config.minVolume());
         log.info("  Active Slots: {}", config.slotCount());
         log.info("  Scan Interval: {} min", config.refreshIntervalMinutes());
-        log.info("  Offer Timeout: {} min", config.offerTimeoutMinutes());
-        log.info("  Cancel Unprofitable: {}", config.cancelUndercutOffers());
-        log.info("  Available GP (inventory): {}", fmt(inventoryGP));
+        log.info("  TS Candidates: {}", config.timeseriesCandidateLimit());
+        log.info("  Available GP : {}", fmt(inventoryGP));
         log.info("========================================");
 
         mainScheduledFuture = scheduledExecutorService.scheduleWithFixedDelay(() -> {
@@ -128,49 +104,57 @@ public class GeFlipperScript extends Script {
         return true;
     }
 
-    // ========================================
+    @Override
+    public void shutdown() {
+        super.shutdown();
+        if (wikiClient != null) wikiClient.shutdown();
+        activeFlips.clear();
+        analyzedItems.clear();
+        log.info("[GEFlipper] Shutdown. Final profit: {} gp over {} flips",
+                fmt(sessionTotalProfit), sessionFlipsCompleted);
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
     // MAIN LOOP
-    // ========================================
+    // ════════════════════════════════════════════════════════════════════════
 
     private void executeFlipLoop() {
         long now = System.currentTimeMillis();
 
-        // 1. Check and collect completed offers
+        // 1. Collect any completed/cancelled offers
         checkAndCollectFinishedOffers();
 
-        // 2. Refresh inventory GP budget every 5 seconds
-        if ((now - lastBudgetCheck) > 5000) {
+        // 2. Refresh GP budget every 5 s
+        if ((now - lastBudgetCheckMs) > 5_000) {
             refreshInventoryGP();
-            lastBudgetCheck = now;
+            lastBudgetCheckMs = now;
         }
 
-        // 3. Monitor active offers for stale/unprofitable prices
-        if ((now - lastPriceRecheck) > (config.priceRecheckSeconds() * 1000L)) {
-            if (config.cancelUndercutOffers()) {
-                monitorActiveOffers();
-            }
+        // 3. Monitor active offers for stale / undercut prices
+        if ((now - lastPriceRecheckMs) > (config.priceRecheckSeconds() * 1_000L)) {
+            if (config.cancelUndercutOffers()) monitorActiveOffers();
             checkStaleOffers(now);
-            lastPriceRecheck = now;
+            lastPriceRecheckMs = now;
         }
 
         // 4. Full market scan on interval
-        long scanIntervalMs = config.refreshIntervalMinutes() * 60 * 1000L;
-        if ((now - lastFullScan) >= scanIntervalMs) {
+        long scanIntervalMs = config.refreshIntervalMinutes() * 60_000L;
+        if ((now - lastFullScanMs) >= scanIntervalMs) {
             Microbot.status = "GE Flipper: Scanning market...";
             scanForFlipOpportunities();
-            lastFullScan = now;
+            lastFullScanMs = now;
         }
 
-        // 5. Fill empty slots with best opportunities
+        // 5. Fill any empty slots
         fillEmptySlots();
 
-        // 6. Update status
+        // 6. Update HUD status
         updateStatus();
     }
 
-    // ========================================
+    // ════════════════════════════════════════════════════════════════════════
     // BUDGET MANAGEMENT
-    // ========================================
+    // ════════════════════════════════════════════════════════════════════════
 
     private void refreshInventoryGP() {
         int totalGP = Microbot.getClientThread().runOnClientThreadOptional(() -> {
@@ -178,41 +162,41 @@ public class GeFlipperScript extends Script {
             List<Rs2ItemModel> coins = Rs2Inventory.items(
                 Rs2ItemModel.matches(true, "Coins")
             ).collect(Collectors.toList());
-            for (Rs2ItemModel coinStack : coins) {
-                if (coinStack != null && coinStack.getId() == COINS_ITEM_ID) {
-                    gp += coinStack.getQuantity();
+            for (Rs2ItemModel coin : coins) {
+                if (coin != null && coin.getId() == COINS_ITEM_ID) {
+                    gp += coin.getQuantity();
                 }
             }
             return gp;
         }).orElse(0);
 
-        int previousGP = inventoryGP;
+        int prev = inventoryGP;
         inventoryGP = totalGP;
 
-        if (inventoryGP != previousGP && previousGP > 0) {
-            int diff = inventoryGP - previousGP;
-            if (diff > 0) {
-                log.info("[GEFlipper] Budget increased: {} -> {} (+{})",
-                    fmt(previousGP), fmt(inventoryGP), fmt(diff));
-            } else {
-                log.info("[GEFlipper] Budget decreased: {} -> {} ({})",
-                    fmt(previousGP), fmt(inventoryGP), fmt(diff));
-            }
+        if (inventoryGP != prev && prev > 0) {
+            int diff = inventoryGP - prev;
+            log.info("[GEFlipper] GP {} → {} ({}{} gp)",
+                    fmt(prev), fmt(inventoryGP), diff > 0 ? "+" : "", fmt(diff));
         }
     }
 
+    /**
+     * Returns GP available for new buy orders.
+     * FIXED: committed GP now accounts for the FULL order cost (totalQuantity * buyPrice),
+     * not just the partial quantity received so far.
+     */
     private int getFreeGP() {
         if (inventoryGP <= 0) return 0;
-        int committedBudget = 0;
-        for (FlipTracker tracker : activeFlips.values()) {
-            committedBudget += tracker.getCommittedGP();
+        int committed = 0;
+        for (FlipTracker t : activeFlips.values()) {
+            committed += t.getCommittedGP();
         }
-        return Math.max(0, inventoryGP - committedBudget);
+        return Math.max(0, inventoryGP - committed);
     }
 
-    // ========================================
+    // ════════════════════════════════════════════════════════════════════════
     // OFFER COLLECTION & LIFECYCLE
-    // ========================================
+    // ════════════════════════════════════════════════════════════════════════
 
     private void checkAndCollectFinishedOffers() {
         GrandExchangeOffer[] offers = Microbot.getClientThread().runOnClientThreadOptional(() ->
@@ -226,24 +210,21 @@ public class GeFlipperScript extends Script {
 
             GrandExchangeSlots slot = GrandExchangeSlots.values()[i];
             FlipTracker tracker = activeFlips.get(slot);
+
             boolean isComplete = offer.getState() == GrandExchangeOfferState.BOUGHT
-                || offer.getState() == GrandExchangeOfferState.SOLD
-                || offer.getState() == GrandExchangeOfferState.CANCELLED_BUY
-                || offer.getState() == GrandExchangeOfferState.CANCELLED_SELL;
+                    || offer.getState() == GrandExchangeOfferState.SOLD
+                    || offer.getState() == GrandExchangeOfferState.CANCELLED_BUY
+                    || offer.getState() == GrandExchangeOfferState.CANCELLED_SELL;
+
             if (isComplete && tracker != null) {
                 collectFinishedOffer(slot, tracker, offer);
             }
         }
     }
 
-    /**
-     * Collects a finished GE offer and transitions the flip state.
-     * Handles collectToBank: withdraws items from bank if needed before selling.
-     */
     private void collectFinishedOffer(GrandExchangeSlots slot, FlipTracker tracker, GrandExchangeOffer offer) {
         Microbot.status = "Collecting: " + tracker.itemName;
 
-        // Collect the offer on client thread
         boolean collected = Microbot.getClientThread().runOnClientThreadOptional(() -> {
             if (!Rs2GrandExchange.isOpen()) {
                 Rs2GrandExchange.openExchange();
@@ -261,161 +242,143 @@ public class GeFlipperScript extends Script {
         Global.sleep(2000);
 
         if (!collected) {
-            log.warn("[GEFlipper] Failed to collect offer for {} in slot {}", tracker.itemName, slot);
+            log.warn("[GEFlipper] Failed to collect {} in slot {}", tracker.itemName, slot);
             return;
         }
 
-        if (offer.getState() == GrandExchangeOfferState.BOUGHT) {
-            // Bought items — record actual quantity
-            tracker.updateBought(offer.getQuantitySold(), offer.getTotalQuantity());
-            tracker.state = FlipTracker.FlipState.BOUGHT;
+        switch (offer.getState()) {
+            case BOUGHT:
+                tracker.updateBought(offer.getQuantitySold(), offer.getTotalQuantity());
+                tracker.state = FlipTracker.FlipState.BOUGHT;
+                if (config.collectToBank()) withdrawItemsForSell(tracker);
+                placeSellOffer(slot, tracker);
+                break;
 
-            // If items were collected to bank, withdraw them for selling
-            if (config.collectToBank()) {
-                withdrawItemsForSell(tracker);
-            }
+            case SOLD:
+                int soldQty   = offer.getQuantitySold();
+                int sellPrice = offer.getPrice() > 0 ? offer.getPrice() : tracker.sellPrice;
+                long profit   = (long) (sellPrice - tracker.buyPrice) * soldQty;
+                sessionTotalProfit += profit;
+                sessionFlipsCompleted++;
 
-            placeSellOffer(slot, tracker);
+                log.info("[GEFlipper] ✓ Completed: {} x{} | Profit: {} gp | Session: {} gp",
+                        tracker.itemName, soldQty, fmt(profit), fmt(sessionTotalProfit));
 
-        } else if (offer.getState() == GrandExchangeOfferState.SOLD) {
-            // Sold items — calculate real profit from GE data (use long to prevent overflow)
-            int soldQty = offer.getQuantitySold();
-            int buyPrice = tracker.buyPrice;
-            int sellPrice = offer.getPrice() > 0 ? offer.getPrice() : tracker.sellPrice;
-            long profit = (long) (sellPrice - buyPrice) * soldQty;
+                tracker.state = FlipTracker.FlipState.COMPLETED;
+                activeFlips.remove(slot);
+                refreshInventoryGP();
 
-            sessionTotalProfit += profit;
-            sessionFlipsCompleted++;
-            log.info("[GEFlipper] Completed flip: {} — x{} sold, Profit: {} gp",
-                tracker.itemName, soldQty, fmt(profit));
+                // FIXED: after a sell completes, find the BEST new opportunity rather than
+                // re-buying the same item. Re-scan if data is stale first.
+                if (analyzedItems.isEmpty() || isPriceDataStale()) {
+                    log.info("[GEFlipper] Data stale — re-scanning before placing next buy...");
+                    scanForFlipOpportunities();
+                }
+                // Slot is now empty; fillEmptySlots() in the next loop tick will pick the best item.
+                break;
 
-            tracker.state = FlipTracker.FlipState.COMPLETED;
-            activeFlips.remove(slot);
-            refreshInventoryGP();
-
-            // Post-collection re-scan if data is stale
-            if (analyzedItems.isEmpty() || isPriceDataStale()) {
-                log.info("[GEFlipper] Price data stale, re-scanning before next buy...");
-                scanForFlipOpportunities();
-            }
-            placeBuyOffer(slot, tracker.itemId, tracker.itemName);
-
-        } else if (offer.getState() == GrandExchangeOfferState.CANCELLED_BUY
-                || offer.getState() == GrandExchangeOfferState.CANCELLED_SELL) {
-            activeFlips.remove(slot);
-            refreshInventoryGP();
-            log.info("[GEFlipper] Offer cancelled for {}", tracker.itemName);
+            case CANCELLED_BUY:
+            case CANCELLED_SELL:
+                activeFlips.remove(slot);
+                refreshInventoryGP();
+                log.info("[GEFlipper] Offer cancelled for {}", tracker.itemName);
+                break;
         }
     }
 
-    /**
-     * Withdraws items from bank so they can be sold on the GE.
-     * Called when collectToBank=true and a buy offer completed.
-     */
     private void withdrawItemsForSell(FlipTracker tracker) {
-        Microbot.status = "Withdrawing " + tracker.itemName + " from bank";
-        log.info("[GEFlipper] Withdrawing {} from bank for selling", tracker.itemName);
+        Microbot.status = "Withdrawing " + tracker.itemName;
+        log.info("[GEFlipper] Withdrawing {} from bank for sell", tracker.itemName);
 
-        // Check if already in inventory (edge case)
-        boolean alreadyInInventory = Microbot.getClientThread().runOnClientThreadOptional(() ->
-            Rs2Inventory.hasItem(tracker.itemName, true)
+        // Check inventory first to avoid a redundant bank trip
+        boolean alreadyHeld = Microbot.getClientThread().runOnClientThreadOptional(() ->
+            Rs2Inventory.hasItem(tracker.itemId)
         ).orElse(false);
 
-        if (alreadyInInventory) {
+        if (alreadyHeld) {
             log.info("[GEFlipper] {} already in inventory, skipping withdraw", tracker.itemName);
             return;
         }
 
-        Microbot.getClientThread().runOnClientThreadOptional(() -> {
-            // Open bank if needed
+        boolean withdrawn = Microbot.getClientThread().runOnClientThreadOptional(() -> {
             if (!net.runelite.client.plugins.microbot.util.bank.Rs2Bank.isOpen()) {
                 net.runelite.client.plugins.microbot.util.bank.Rs2Bank.openBank();
-                Global.sleep(1500);
+                Global.sleepUntil(net.runelite.client.plugins.microbot.util.bank.Rs2Bank::isOpen, 5000);
             }
-            // Withdraw item (withdraws all matching)
-            return net.runelite.client.plugins.microbot.util.bank.Rs2Bank.withdrawItem(tracker.itemName);
-        });
+            // Use item ID instead of name to handle noted/variant items correctly
+            return net.runelite.client.plugins.microbot.util.bank.Rs2Bank.withdrawX(tracker.itemId, tracker.totalQuantity);
+        }).orElse(false);
 
-        // Wait for items to appear in inventory
-        Global.sleepUntil(() -> Rs2Inventory.hasItem(tracker.itemName, true), 5000);
+        // Wait for items to appear in inventory (up to 5 s)
+        if (withdrawn) {
+            Global.sleepUntil(() -> Microbot.getClientThread()
+                    .runOnClientThreadOptional(() -> Rs2Inventory.hasItem(tracker.itemId))
+                    .orElse(false), 5000);
+        }
     }
 
     private boolean isPriceDataStale() {
-        long maxAge = config.refreshIntervalMinutes() * 60 * 1000L * 2;
-        return (System.currentTimeMillis() - lastFullScan) > maxAge;
+        long maxAgeMs = config.refreshIntervalMinutes() * 60_000L * 2;
+        return (System.currentTimeMillis() - lastFullScanMs) > maxAgeMs;
     }
 
-    // ========================================
+    // ════════════════════════════════════════════════════════════════════════
     // OFFER MONITORING
-    // ========================================
+    // ════════════════════════════════════════════════════════════════════════
 
     private void monitorActiveOffers() {
-        if (activeFlips.isEmpty() || cachedLatestPrices.isEmpty()) return;
+        if (activeFlips.isEmpty()) return;
 
-        Map<Integer, int[]> freshPrices = fetchLatestPrices();
-        if (!freshPrices.isEmpty()) {
-            cachedLatestPrices = freshPrices;
-        }
+        Map<Integer, int[]> prices = wikiClient.getLatestPrices();
+        if (prices.isEmpty()) return;
 
         List<GrandExchangeSlots> toCancel = new ArrayList<>();
 
         for (Map.Entry<GrandExchangeSlots, FlipTracker> entry : activeFlips.entrySet()) {
             GrandExchangeSlots slot = entry.getKey();
             FlipTracker tracker = entry.getValue();
-            int[] prices = cachedLatestPrices.get(tracker.itemId);
-            if (prices == null) continue;
+            int[] p = prices.get(tracker.itemId);
+            if (p == null) continue;
 
-            int currentHigh = prices[0]; // current sell price
-            int currentLow = prices[1];  // current buy price
+            int currentHigh = p[0];
 
             if (tracker.state == FlipTracker.FlipState.BUYING) {
-                int currentSpread = currentHigh - tracker.buyPrice;
-                double currentMargin = tracker.buyPrice > 0
-                    ? (double) currentSpread / tracker.buyPrice * 100.0 : 0;
-                if (currentMargin < config.minProfitMargin()) {
-                    log.info("[GEFlipper] Spread closed on {} (buying @ {}, sell now @ {}, margin {}%), cancelling",
-                        tracker.itemName, fmt(tracker.buyPrice), fmt(currentHigh), String.format("%.1f", currentMargin));
+                int spread = currentHigh - tracker.buyPrice;
+                double margin = tracker.buyPrice > 0 ? (double) spread / tracker.buyPrice * 100.0 : 0;
+                if (margin < config.minProfitMargin()) {
+                    log.info("[GEFlipper] Spread closed on {} (margin {:.1f}%), cancelling buy",
+                            tracker.itemName, margin);
                     toCancel.add(slot);
                 }
             } else if (tracker.state == FlipTracker.FlipState.BOUGHT
                     || tracker.state == FlipTracker.FlipState.SELLING) {
-                if (currentHigh < tracker.sellPrice) {
-                    int currentProfit = currentHigh - tracker.buyPrice;
-                    double currentMargin = tracker.buyPrice > 0
-                        ? (double) currentProfit / tracker.buyPrice * 100.0 : 0;
-                    if (currentMargin < config.minProfitMargin()) {
-                        log.info("[GEFlipper] Sell no longer profitable on {} (margin {}%), cancelling",
-                            tracker.itemName, String.format("%.1f", currentMargin));
-                        toCancel.add(slot);
-                    }
+                int currentProfit = currentHigh - tracker.buyPrice;
+                double margin = tracker.buyPrice > 0 ? (double) currentProfit / tracker.buyPrice * 100.0 : 0;
+                if (margin < config.minProfitMargin()) {
+                    log.info("[GEFlipper] Sell no longer profitable on {} (margin {:.1f}%), cancelling",
+                            tracker.itemName, margin);
+                    toCancel.add(slot);
                 }
             }
         }
 
-        for (GrandExchangeSlots slot : toCancel) {
-            cancelOffer(slot);
-        }
+        toCancel.forEach(this::cancelOffer);
     }
 
     private void checkStaleOffers(long now) {
-        int timeoutMs = config.offerTimeoutMinutes() * 60 * 1000;
+        int timeoutMs = config.offerTimeoutMinutes() * 60_000;
         if (timeoutMs <= 0) return;
 
-        List<GrandExchangeSlots> toCancel = new ArrayList<>();
-        for (Map.Entry<GrandExchangeSlots, FlipTracker> entry : activeFlips.entrySet()) {
-            FlipTracker tracker = entry.getValue();
-            if (tracker.state == FlipTracker.FlipState.BUYING) {
-                long elapsed = now - tracker.startTime;
-                if (elapsed > timeoutMs) {
-                    log.info("[GEFlipper] Offer stale: {} ({} min elapsed, timeout {} min), cancelling",
-                        tracker.itemName, String.format("%.0f", elapsed / 60000.0), config.offerTimeoutMinutes());
-                    toCancel.add(entry.getKey());
-                }
-            }
-        }
-        for (GrandExchangeSlots slot : toCancel) {
-            cancelOffer(slot);
-        }
+        activeFlips.entrySet().stream()
+            .filter(e -> e.getValue().state == FlipTracker.FlipState.BUYING
+                    && (now - e.getValue().startTime) > timeoutMs)
+            .map(Map.Entry::getKey)
+            .collect(Collectors.toList())
+            .forEach(slot -> {
+                log.info("[GEFlipper] Offer timed out: {} ({}min), cancelling",
+                        activeFlips.get(slot).itemName, config.offerTimeoutMinutes());
+                cancelOffer(slot);
+            });
     }
 
     private void cancelOffer(GrandExchangeSlots slot) {
@@ -423,52 +386,43 @@ public class GeFlipperScript extends Script {
         if (tracker == null) return;
 
         Microbot.status = "Cancelling: " + tracker.itemName;
-        log.info("[GEFlipper] Cancelling offer for {} in slot {}", tracker.itemName, slot);
+        log.info("[GEFlipper] Cancelling {} in slot {}", tracker.itemName, slot);
 
-        // Cancel on client thread — only remove from tracking AFTER confirming success
-        boolean cancelled = Microbot.getClientThread().runOnClientThreadOptional(() -> {
+        boolean ok = Microbot.getClientThread().runOnClientThreadOptional(() -> {
             if (!Rs2GrandExchange.isOpen()) {
                 Rs2GrandExchange.openExchange();
                 Global.sleep(1500);
             }
-            Rs2GrandExchange.cancelSpecificOffers(
-                Collections.singletonList(slot), config.collectToBank());
+            Rs2GrandExchange.cancelSpecificOffers(Collections.singletonList(slot), config.collectToBank());
             return true;
         }).orElse(false);
 
         Global.sleep(2000);
 
-        if (cancelled) {
+        if (ok) {
             activeFlips.remove(slot);
             refreshInventoryGP();
-            log.info("[GEFlipper] Cancelled offer for {}, budget refreshed", tracker.itemName);
         } else {
-            log.warn("[GEFlipper] Failed to cancel offer for {} in slot {}", tracker.itemName, slot);
+            log.warn("[GEFlipper] Failed to cancel {} in slot {}", tracker.itemName, slot);
         }
     }
 
-    // ========================================
+    // ════════════════════════════════════════════════════════════════════════
     // STARTUP RECONCILIATION
-    // ========================================
+    // ════════════════════════════════════════════════════════════════════════
 
-    /**
-     * Scans all GE slots at startup and handles any existing offers.
-     * Handles: uncollected completed offers, active buys/sells, cancelled offers.
-     */
     private void reconcileExistingOffers() {
         GrandExchangeOffer[] offers = Microbot.getClientThread().runOnClientThreadOptional(() ->
             Microbot.getClient().getGrandExchangeOffers()
         ).orElse(new GrandExchangeOffer[0]);
 
         int slotsToUse = config.slotCount();
-        int found = 0;
-        int collected = 0;
-        int tracking = 0;
+        int found = 0, collected = 0, tracking = 0;
 
         for (int i = 0; i < slotsToUse && i < offers.length; i++) {
             GrandExchangeOffer offer = offers[i];
-            if (offer == null || offer.getState() == null) continue;
-            if (offer.getState() == GrandExchangeOfferState.EMPTY) continue;
+            if (offer == null || offer.getState() == null
+                    || offer.getState() == GrandExchangeOfferState.EMPTY) continue;
 
             GrandExchangeSlots slot = GrandExchangeSlots.values()[i];
             int itemId = offer.getItemId();
@@ -479,163 +433,191 @@ public class GeFlipperScript extends Script {
 
             switch (offer.getState()) {
                 case BOUGHT:
-                case SOLD:
-                    // Completed but uncollected — collect and transition
-                    log.info("[GEFlipper] Reconciliation: uncollected {} offer in slot {} — {}",
-                        offer.getState().name().toLowerCase(), slot, itemName);
-                    FlipTracker tracker = new FlipTracker(
-                        itemId, itemName, slot,
-                        offer.getPrice(), offer.getPrice(), offer.getTotalQuantity());
+                case SOLD: {
+                    log.info("[GEFlipper] Reconcile: uncollected {} — {}", offer.getState(), itemName);
+                    FlipTracker t = new FlipTracker(itemId, itemName, slot,
+                            offer.getPrice(), offer.getPrice(), offer.getTotalQuantity());
                     if (offer.getState() == GrandExchangeOfferState.BOUGHT) {
-                        tracker.state = FlipTracker.FlipState.BOUGHT;
-                        tracker.updateBought(offer.getQuantitySold(), offer.getTotalQuantity());
+                        t.state = FlipTracker.FlipState.BOUGHT;
+                        t.updateBought(offer.getQuantitySold(), offer.getTotalQuantity());
                     } else {
-                        tracker.state = FlipTracker.FlipState.SOLD;
-                        tracker.updateSold(offer.getQuantitySold());
+                        t.state = FlipTracker.FlipState.SOLD;
+                        t.updateSold(offer.getQuantitySold());
                     }
-                    activeFlips.put(slot, tracker);
-                    collectFinishedOffer(slot, tracker, offer);
+                    activeFlips.put(slot, t);
+                    collectFinishedOffer(slot, t, offer);
                     collected++;
                     break;
-
-                case BUYING:
-                    // Active buy — track it, set sellPrice from current market if available
-                    log.info("[GEFlipper] Reconciliation: tracking active buy in slot {} — {} x{} @ {}",
-                        slot, itemName, offer.getQuantitySold() + "/" + offer.getTotalQuantity(),
-                        fmt(offer.getPrice()));
-                    int[] prices = cachedLatestPrices.get(itemId);
-                    int estSellPrice = (prices != null && prices[0] > 0) ? prices[0] : (int) (offer.getPrice() * 1.03);
-                    FlipTracker buyTracker = new FlipTracker(
-                        itemId, itemName, slot,
-                        offer.getPrice(), estSellPrice, offer.getTotalQuantity());
-                    buyTracker.updateBought(offer.getQuantitySold(), offer.getTotalQuantity());
-                    activeFlips.put(slot, buyTracker);
+                }
+                case BUYING: {
+                    log.info("[GEFlipper] Reconcile: active buy — {} @ {}", itemName, fmt(offer.getPrice()));
+                    int[] p = wikiClient.getLatestPrices().getOrDefault(itemId, null);
+                    int estSell = (p != null && p[0] > 0) ? p[0] : (int) (offer.getPrice() * 1.03);
+                    FlipTracker t = new FlipTracker(itemId, itemName, slot,
+                            offer.getPrice(), estSell, offer.getTotalQuantity());
+                    t.updateBought(offer.getQuantitySold(), offer.getTotalQuantity());
+                    activeFlips.put(slot, t);
                     tracking++;
                     break;
-
-                case SELLING:
-                    // Active sell — track it
-                    log.info("[GEFlipper] Reconciliation: tracking active sell in slot {} — {} x{} @ {}",
-                        slot, itemName, offer.getQuantitySold() + "/" + offer.getTotalQuantity(),
-                        fmt(offer.getPrice()));
-                    int estBuyPrice = (int) (offer.getPrice() * 0.97);
-                    FlipTracker sellTracker = new FlipTracker(
-                        itemId, itemName, slot,
-                        estBuyPrice, offer.getPrice(), offer.getTotalQuantity());
-                    sellTracker.state = FlipTracker.FlipState.SELLING;
-                    sellTracker.updateSold(offer.getQuantitySold());
-                    activeFlips.put(slot, sellTracker);
+                }
+                case SELLING: {
+                    log.info("[GEFlipper] Reconcile: active sell — {} @ {}", itemName, fmt(offer.getPrice()));
+                    int estBuy = (int) (offer.getPrice() * 0.97);
+                    FlipTracker t = new FlipTracker(itemId, itemName, slot,
+                            estBuy, offer.getPrice(), offer.getTotalQuantity());
+                    t.state = FlipTracker.FlipState.SELLING;
+                    t.updateSold(offer.getQuantitySold());
+                    activeFlips.put(slot, t);
                     tracking++;
                     break;
-
+                }
                 case CANCELLED_BUY:
-                case CANCELLED_SELL:
-                    // Cancelled with items — collect to free slot
-                    log.info("[GEFlipper] Reconciliation: cancelled offer in slot {} — collecting {}",
-                        slot, itemName);
-                    FlipTracker cancelTracker = new FlipTracker(
-                        itemId, itemName, slot, offer.getPrice(), offer.getPrice(), offer.getTotalQuantity());
-                    activeFlips.put(slot, cancelTracker);
-                    collectFinishedOffer(slot, cancelTracker, offer);
+                case CANCELLED_SELL: {
+                    log.info("[GEFlipper] Reconcile: cancelled offer — collecting {}", itemName);
+                    FlipTracker t = new FlipTracker(itemId, itemName, slot,
+                            offer.getPrice(), offer.getPrice(), offer.getTotalQuantity());
+                    activeFlips.put(slot, t);
+                    collectFinishedOffer(slot, t, offer);
                     collected++;
                     break;
+                }
             }
             found++;
         }
 
-        if (found > 0) {
-            log.info("[GEFlipper] Reconciliation complete: {} offers found, {} collected, {} now tracked",
+        log.info("[GEFlipper] Reconcile: {} offers found, {} collected, {} tracked",
                 found, collected, tracking);
-        } else {
-            log.info("[GEFlipper] Reconciliation: no existing offers found, all slots available");
-        }
     }
 
-    // ========================================
-    // MARKET SCANNING — Optimized two-stage
-    // ========================================
+    // ════════════════════════════════════════════════════════════════════════
+    // MARKET SCANNING — two-stage with async timeseries
+    // ════════════════════════════════════════════════════════════════════════
 
     private void scanForFlipOpportunities() {
         analyzedItems.clear();
         try {
-            // Stage 1: Cached mapping + bulk latest prices
-            if (cachedItemMapping.isEmpty() ||
-                (System.currentTimeMillis() - lastMappingFetch) > MAPPING_CACHE_DURATION) {
-                cachedItemMapping = getItemMapping();
-                lastMappingFetch = System.currentTimeMillis();
-                log.info("[GEFlipper] Loaded {} items from mapping", cachedItemMapping.size());
+            // Stage 1: Bulk mapping + latest prices (both cached by WikiPriceClient)
+            Map<Integer, ItemMappingData> mapping = wikiClient.getItemMapping();
+            Map<Integer, int[]> latestPrices = wikiClient.getLatestPrices();
+
+            if (mapping.isEmpty() || latestPrices.isEmpty()) {
+                log.warn("[GEFlipper] Scan aborted: could not fetch market data");
+                return;
             }
 
-            Map<Integer, int[]> latestPrices = fetchLatestPrices();
-            if (latestPrices.isEmpty()) {
-                log.warn("[GEFlipper] Failed to fetch latest prices, using cached");
-                latestPrices = cachedLatestPrices;
-            } else {
-                cachedLatestPrices = latestPrices;
-            }
-            log.info("[GEFlipper] Loaded prices for {} items", latestPrices.size());
-
-            // Stage 2: Initial spread filter
+            // Stage 2: Spread filter — build candidate list
             Set<String> blacklist = parseBlacklist();
+            Set<String> customList = parseCustomList();
             List<Candidate> candidates = new ArrayList<>();
 
-            for (Map.Entry<Integer, ItemMappingData> entry : cachedItemMapping.entrySet()) {
+            for (Map.Entry<Integer, ItemMappingData> entry : mapping.entrySet()) {
                 int itemId = entry.getKey();
-                ItemMappingData metadata = entry.getValue();
-                if (!shouldConsiderItem(metadata, blacklist)) continue;
+                ItemMappingData meta = entry.getValue();
+
+                // FlipMode: CUSTOM_LIST restricts to user-specified items
+                if (config.flipMode() == FlipMode.CUSTOM_LIST) {
+                    if (!customList.contains(meta.name.toLowerCase())) continue;
+                } else {
+                    if (!shouldConsiderItem(meta, blacklist)) continue;
+                }
 
                 int[] prices = latestPrices.get(itemId);
-                if (prices == null) continue;
+                if (prices == null || prices[0] <= 0 || prices[1] <= 0) continue;
 
-                int highPrice = prices[0];
-                int lowPrice = prices[1];
-                if (highPrice <= 0 || lowPrice <= 0) continue;
-
-                int spread = highPrice - lowPrice;
-                double margin = lowPrice > 0 ? (double) spread / lowPrice * 100.0 : 0;
+                int spread = prices[0] - prices[1];
+                double margin = (double) spread / prices[1] * 100.0;
                 if (margin < config.minProfitMargin()) continue;
 
-                double initialScore = calculateInitialScore(spread, margin, metadata);
-                candidates.add(new Candidate(itemId, metadata.name, metadata, highPrice, lowPrice, initialScore));
+                double score = calculateInitialScore(spread, margin, meta, config.flipMode());
+                candidates.add(new Candidate(itemId, meta.name, meta, prices[0], prices[1], score));
             }
 
-            log.info("[GEFlipper] Found {} items with viable spreads", candidates.size());
+            log.info("[GEFlipper] {} candidates after spread filter", candidates.size());
 
-            // Stage 3: Timeseries only for top N candidates
+            // Sort and cap for timeseries
             candidates.sort((a, b) -> Double.compare(b.initialScore, a.initialScore));
-            int timeseriesCount = Math.min(TIMESERIES_CANDIDATE_LIMIT, candidates.size());
-            log.info("[GEFlipper] Running timeseries analysis on top {} candidates...", timeseriesCount);
+            int tsLimit = config.timeseriesCandidateLimit();
 
-            for (int i = 0; i < timeseriesCount; i++) {
-                Candidate c = candidates.get(i);
-                TimeSeriesAnalysis analysis = getTimeSeriesAnalysis(c.itemId);
-                if (analysis == null || analysis.dataPoints.isEmpty()) continue;
+            List<Integer> tsIds = candidates.stream()
+                    .limit(tsLimit)
+                    .map(c -> c.itemId)
+                    .collect(Collectors.toList());
 
-                FlipAnalysis flipAnalysis = new FlipAnalysis(c.itemId, c.itemName, c.metadata, analysis);
-                if (flipAnalysis.meetsMinProfit(config.minProfitMargin())) {
-                    analyzedItems.add(flipAnalysis);
+            // Stage 3: Async batch timeseries (rate-limited inside WikiPriceClient)
+            int timeoutSec = tsLimit * 4 + 30; // generous timeout: 3 s/item + buffer
+            Map<Integer, TimeSeriesAnalysis> tsResults = wikiClient.getBatchTimeSeries(tsIds, tsLimit, timeoutSec);
+
+            // Stage 4: Build FlipAnalysis for all candidates that passed timeseries
+            for (Candidate c : candidates.subList(0, Math.min(tsLimit, candidates.size()))) {
+                TimeSeriesAnalysis ts = tsResults.get(c.itemId);
+                if (ts == null || ts.dataPoints.isEmpty()) continue;
+
+                // Apply minVolume filter now that we have timeseries data
+                int vol4h = ts.calculateVolumePer4Hours();
+                if (vol4h < config.minVolume()) continue;
+
+                FlipAnalysis fa = new FlipAnalysis(c.itemId, c.itemName, c.metadata, ts);
+                if (fa.meetsMinProfit(config.minProfitMargin())) {
+                    analyzedItems.add(fa);
                 }
             }
 
-            analyzedItems.sort((a, b) -> Double.compare(b.flipScore, a.flipScore));
+            // Sort by flip score, with FlipMode weighting applied
+            analyzedItems.sort((a, b) -> Double.compare(
+                    getModeAdjustedScore(b), getModeAdjustedScore(a)));
 
-            log.info("[GEFlipper] Found {} viable flip opportunities", analyzedItems.size());
-            if (!analyzedItems.isEmpty()) {
-                log.info("[GEFlipper] Top 5 flips:");
-                for (int i = 0; i < Math.min(5, analyzedItems.size()); i++) {
-                    log.info("  {}. {}", i + 1, analyzedItems.get(i));
-                }
+            log.info("[GEFlipper] Scan complete: {} viable opportunities", analyzedItems.size());
+            for (int i = 0; i < Math.min(5, analyzedItems.size()); i++) {
+                log.info("  {}. {}", i + 1, analyzedItems.get(i));
             }
+
         } catch (Exception ex) {
-            log.error("[GEFlipper] Failed to scan for flip opportunities: ", ex);
+            log.error("[GEFlipper] Scan failed: ", ex);
         }
     }
 
-    private double calculateInitialScore(int spread, double margin, ItemMappingData metadata) {
-        double profitScore = Math.min(40.0, spread / 100.0 * 40.0);
-        double marginScore = Math.min(30.0, margin * 3.0);
-        double volumeScore = Math.min(20.0, metadata.getEffectiveTradeLimit() / 50.0 * 20.0);
-        return profitScore + marginScore + volumeScore + 5.0;
+    /**
+     * Initial scoring before timeseries — used to rank candidates for the TS fetch queue.
+     * Weights vary by FlipMode so that the most relevant items are fetched first.
+     */
+    private double calculateInitialScore(int spread, double margin, ItemMappingData meta, FlipMode mode) {
+        double tradeLimit = meta.getEffectiveTradeLimit();
+        switch (mode) {
+            case HIGH_VOLUME:
+                // Prioritise high-volume, high-limit items (faster, smaller margin acceptable)
+                return (tradeLimit / 50.0 * 50.0) + (margin * 2.0) + Math.min(30.0, spread / 200.0 * 30.0);
+
+            case HIGH_MARGIN:
+                // Prioritise raw margin and spread value
+                return (margin * 5.0) + Math.min(50.0, spread / 50.0 * 50.0) + (tradeLimit / 200.0 * 10.0);
+
+            case BALANCED:
+            case CUSTOM_LIST:
+            default:
+                // Equal weighting
+                return Math.min(40.0, spread / 100.0 * 40.0)
+                        + Math.min(30.0, margin * 3.0)
+                        + Math.min(20.0, tradeLimit / 50.0 * 20.0)
+                        + 5.0;
+        }
+    }
+
+    /**
+     * Post-timeseries score adjustment for final sort ordering.
+     * HIGH_VOLUME: boosts by estimated 4h volume.
+     * HIGH_MARGIN: boosts by profit-per-unit.
+     */
+    private double getModeAdjustedScore(FlipAnalysis fa) {
+        switch (config.flipMode()) {
+            case HIGH_VOLUME:
+                return fa.flipScore + (fa.estimatedVolumePer4Hours / 500.0 * 20.0);
+            case HIGH_MARGIN:
+                return fa.flipScore + (fa.profitPerUnit / 100.0 * 20.0);
+            case CUSTOM_LIST:
+            case BALANCED:
+            default:
+                return fa.flipScore;
+        }
     }
 
     private static class Candidate {
@@ -643,6 +625,7 @@ public class GeFlipperScript extends Script {
         final String itemName;
         final ItemMappingData metadata;
         final double initialScore;
+
         Candidate(int itemId, String itemName, ItemMappingData metadata,
                   int highPrice, int lowPrice, double initialScore) {
             this.itemId = itemId;
@@ -652,28 +635,42 @@ public class GeFlipperScript extends Script {
         }
     }
 
-    // ========================================
-    // SLOT FILLING — Best affordable first
-    // ========================================
+    // ════════════════════════════════════════════════════════════════════════
+    // SLOT FILLING
+    // ════════════════════════════════════════════════════════════════════════
 
     private void fillEmptySlots() {
         int slotsToUse = config.slotCount();
+
         GrandExchangeOffer[] offers = Microbot.getClientThread().runOnClientThreadOptional(() ->
             Microbot.getClient().getGrandExchangeOffers()
         ).orElse(new GrandExchangeOffer[0]);
 
+        if (offers.length < 8) {
+            log.warn("[GEFlipper] GE offers array incomplete ({}/8), skipping slot fill", offers.length);
+            return;
+        }
+
+        // FIXED: iterate all slots per tick, not just the first empty one
         for (int i = 0; i < slotsToUse && i < offers.length; i++) {
             GrandExchangeOffer offer = offers[i];
-            // Null-safe check
             if (offer == null) continue;
+
             GrandExchangeSlots slot = GrandExchangeSlots.values()[i];
-            if (!activeFlips.containsKey(slot) && offer.getState() == GrandExchangeOfferState.EMPTY) {
-                FlipAnalysis bestAffordable = findBestAffordableFlip();
-                if (bestAffordable != null) {
-                    placeBuyOffer(slot, bestAffordable.itemId, bestAffordable.itemName);
-                }
-                break;
+            if (activeFlips.containsKey(slot)) continue;
+            if (offer.getState() != GrandExchangeOfferState.EMPTY) continue;
+
+            FlipAnalysis best = findBestAffordableFlip();
+            if (best == null) {
+                log.info("[GEFlipper] No affordable flip opportunities found");
+                break; // No point checking further slots if we're out of options/budget
             }
+
+            log.info("[GEFlipper] Slot {} empty — placing buy for {}", i + 1, best.itemName);
+            placeBuyOffer(slot, best.itemId, best.itemName);
+
+            // Brief pause between placing offers on multiple slots
+            Global.sleep(1000);
         }
     }
 
@@ -681,10 +678,17 @@ public class GeFlipperScript extends Script {
         int availableGP = getFreeGP();
         if (availableGP <= 0) return null;
 
+        // Collect item IDs already being actively flipped to avoid duplicates
+        Set<Integer> activeItemIds = activeFlips.values().stream()
+                .map(t -> t.itemId)
+                .collect(Collectors.toSet());
+
         FlipAnalysis best = null;
-        double bestEffectiveScore = -1;
+        double bestScore = -1;
 
         for (FlipAnalysis fa : analyzedItems) {
+            if (activeItemIds.contains(fa.itemId)) continue; // already flipping this item
+
             int buyPrice = (int) (fa.recommendedBuyPrice * (1.0 + config.buyPriceOffset() / 100.0));
             if (buyPrice <= 0) continue;
 
@@ -692,291 +696,187 @@ public class GeFlipperScript extends Script {
             if (affordableQty <= 0) continue;
 
             if (config.maxInvestmentPerSlot() > 0) {
-                int maxByConfig = config.maxInvestmentPerSlot() / buyPrice;
-                affordableQty = Math.min(affordableQty, maxByConfig);
+                affordableQty = Math.min(affordableQty, config.maxInvestmentPerSlot() / buyPrice);
                 if (affordableQty <= 0) continue;
             }
 
-            int totalProfit = fa.profitPerUnit * affordableQty;
-            double effectiveScore = (fa.flipScore * 0.6) + ((totalProfit / 100.0) * 0.4);
+            double effectiveScore = getModeAdjustedScore(fa)
+                    + ((long) fa.profitPerUnit * affordableQty / 1000.0 * 0.1);
 
-            if (effectiveScore > bestEffectiveScore) {
-                bestEffectiveScore = effectiveScore;
+            if (effectiveScore > bestScore) {
+                bestScore = effectiveScore;
                 best = fa;
             }
         }
         return best;
     }
 
-    // ========================================
-    // BUY / SELL OFFER PLACEMENT
-    // ========================================
+    // ════════════════════════════════════════════════════════════════════════
+    // OFFER PLACEMENT
+    // ════════════════════════════════════════════════════════════════════════
 
     private void placeBuyOffer(GrandExchangeSlots slot, int itemId, String itemName) {
         Microbot.status = "Buying: " + itemName;
 
         FlipAnalysis analysis = analyzedItems.stream()
-            .filter(a -> a.itemId == itemId)
-            .findFirst()
-            .orElse(null);
+                .filter(a -> a.itemId == itemId)
+                .findFirst().orElse(null);
 
         if (analysis == null) {
-            log.warn("[GEFlipper] No analysis found for {}, skipping", itemName);
+            log.warn("[GEFlipper] No analysis for {}, skipping buy", itemName);
             return;
         }
 
         int buyPrice = (int) (analysis.recommendedBuyPrice * (1.0 + config.buyPriceOffset() / 100.0));
         int quantity = analysis.maxFlipQuantity;
+        int freeGP   = getFreeGP();
 
-        int availableGP = getFreeGP();
-        if (availableGP > 0) {
-            quantity = Math.min(quantity, availableGP / buyPrice);
-        }
+        quantity = Math.min(quantity, freeGP / Math.max(1, buyPrice));
         if (config.maxInvestmentPerSlot() > 0) {
-            quantity = Math.min(quantity, config.maxInvestmentPerSlot() / buyPrice);
+            quantity = Math.min(quantity, config.maxInvestmentPerSlot() / Math.max(1, buyPrice));
         }
 
         if (quantity <= 0) {
-            log.warn("[GEFlipper] Cannot afford {} (need {} gp each, have {} gp free)",
-                itemName, fmt(buyPrice), fmt(availableGP));
+            log.warn("[GEFlipper] Can't afford {} @ {} gp (free: {})", itemName, fmt(buyPrice), fmt(freeGP));
             return;
         }
 
         final int fBuyPrice = buyPrice;
-        final int fQuantity = quantity;
-        final String fItemName = itemName;
-        final GrandExchangeSlots fSlot = slot;
-        final int fItemId = itemId;
+        final int fQty      = quantity;
 
-        // Ensure GE is open before placing offer
-        Microbot.getClientThread().runOnClientThreadOptional(() -> {
+        boolean geOpen = Microbot.getClientThread().runOnClientThreadOptional(() -> {
             if (!Rs2GrandExchange.isOpen()) {
-                Rs2GrandExchange.openExchange();
-                Global.sleep(3000); // Give client time to render GE UI
+                if (!Rs2GrandExchange.openExchange()) return false;
             }
-            return true;
-        });
+            if (Rs2GrandExchange.isOfferScreenOpen()) {
+                Rs2GrandExchange.backToOverview();
+                Global.sleep(800);
+            }
+            return Rs2GrandExchange.isOpen();
+        }).orElse(false);
 
-        log.info("[GEFlipper] Placing buy offer: {} x{} @ {} gp (free GP: {})",
-            fItemName, fQuantity, fmt(fBuyPrice), fmt(availableGP));
+        if (!geOpen) {
+            log.error("[GEFlipper] Failed to open GE");
+            return;
+        }
+
+        Global.sleep(2000);
+
+        boolean slotsReady = Microbot.getClientThread().runOnClientThreadOptional(() ->
+                Rs2GrandExchange.getAvailableSlot() != null
+        ).orElse(false);
+
+        if (!slotsReady) {
+            log.error("[GEFlipper] GE slots not ready, retrying later");
+            return;
+        }
+
+        log.info("[GEFlipper] Placing buy: {} x{} @ {} gp", itemName, fQty, fmt(fBuyPrice));
 
         boolean success = Microbot.getClientThread().runOnClientThreadOptional(() ->
             Rs2GrandExchange.processOffer(
                 GrandExchangeRequest.builder()
                     .action(GrandExchangeAction.BUY)
-                    .itemName(fItemName)
+                    .itemName(itemName)
                     .exact(true)
-                    .quantity(fQuantity)
+                    .quantity(fQty)
                     .price(fBuyPrice)
-                    .slot(fSlot)
+                    .slot(slot)
                     .build()
             )
         ).orElse(false);
 
-        // Extra delay after offer to let GE state settle
-        Global.sleep(2000);
+        Global.sleep(1500);
 
         if (success) {
-            int cost = buyPrice * quantity;
-            FlipTracker tracker = new FlipTracker(fItemId, fItemName, fSlot, buyPrice, analysis.recommendedSellPrice, quantity);
-            activeFlips.put(fSlot, tracker);
-            log.info("[GEFlipper] Buy offer placed: {} x{} @ {} gp (cost: {})",
-                fItemName, fQuantity, fmt(fBuyPrice), fmt(cost));
+            FlipTracker tracker = new FlipTracker(itemId, itemName, slot,
+                    fBuyPrice, analysis.recommendedSellPrice, fQty);
+            activeFlips.put(slot, tracker);
+            log.info("[GEFlipper] Buy placed: {} x{} @ {} gp (cost: {})",
+                    itemName, fQty, fmt(fBuyPrice), fmt((long) fBuyPrice * fQty));
         } else {
-            log.error("[GEFlipper] Failed to place buy offer for {}", itemName);
+            log.error("[GEFlipper] Failed to place buy for {}", itemName);
         }
-        Global.sleep(1500);
     }
 
     private void placeSellOffer(GrandExchangeSlots slot, FlipTracker tracker) {
         Microbot.status = "Selling: " + tracker.itemName;
 
-        int sellPrice = tracker.sellPrice;
+        // Use fresh analysis for sell price if available; fall back to tracker's price
         FlipAnalysis analysis = analyzedItems.stream()
-            .filter(a -> a.itemId == tracker.itemId)
-            .findFirst()
-            .orElse(null);
-        if (analysis != null) {
-            sellPrice = (int) (analysis.recommendedSellPrice * (1.0 - config.sellPriceOffset() / 100.0));
-        }
+                .filter(a -> a.itemId == tracker.itemId)
+                .findFirst().orElse(null);
 
-        // Guard: don't sell below buy price
+        int sellPrice = (analysis != null)
+                ? (int) (analysis.recommendedSellPrice * (1.0 - config.sellPriceOffset() / 100.0))
+                : tracker.sellPrice;
+
+        // Guard: never sell below buy price
         if (sellPrice <= tracker.buyPrice) {
             sellPrice = (int) (tracker.buyPrice * 1.01);
-            log.info("[GEFlipper] Adjusted sell price to {} (minimum above buy price {})",
-                fmt(sellPrice), fmt(tracker.buyPrice));
+            log.info("[GEFlipper] Sell price below buy price — adjusted to {}", fmt(sellPrice));
         }
 
         final int fSellPrice = sellPrice;
-        final int fQuantity = tracker.totalQuantity;
-        final String fItemName = tracker.itemName;
-        final GrandExchangeSlots fSlot = slot;
+        final int fQty       = tracker.totalQuantity;
 
         boolean success = Microbot.getClientThread().runOnClientThreadOptional(() ->
             Rs2GrandExchange.processOffer(
                 GrandExchangeRequest.builder()
                     .action(GrandExchangeAction.SELL)
-                    .itemName(fItemName)
+                    .itemName(tracker.itemName)
                     .exact(true)
-                    .quantity(fQuantity)
+                    .quantity(fQty)
                     .price(fSellPrice)
-                    .slot(fSlot)
+                    .slot(slot)
                     .build()
             )
         ).orElse(false);
 
         if (success) {
             tracker.state = FlipTracker.FlipState.SELLING;
-            log.info("[GEFlipper] Placed sell offer: {} x{} @ {} gp", fItemName, fQuantity, fmt(fSellPrice));
+            log.info("[GEFlipper] Sell placed: {} x{} @ {} gp", tracker.itemName, fQty, fmt(fSellPrice));
         } else {
-            log.error("[GEFlipper] Failed to place sell offer for {}", tracker.itemName);
+            log.error("[GEFlipper] Failed to place sell for {}", tracker.itemName);
         }
         Global.sleep(1500);
     }
 
-    // ========================================
-    // API FETCH METHODS
-    // ========================================
+    // ════════════════════════════════════════════════════════════════════════
+    // FILTERS
+    // ════════════════════════════════════════════════════════════════════════
 
-    private Map<Integer, ItemMappingData> getItemMapping() {
-        try {
-            HttpRequest request = HttpRequest.newBuilder()
-                .uri(java.net.URI.create(WIKI_MAPPING_URL))
-                .header("User-Agent", API_USER_AGENT)
-                .GET()
-                .build();
-            HttpResponse<String> response = HTTP_CLIENT.send(request, HttpResponse.BodyHandlers.ofString());
-            if (response.statusCode() == 200) {
-                return parseItemMapping(response.body());
-            }
-        } catch (Exception ex) {
-            log.error("[GEFlipper] Failed to fetch item mapping: ", ex);
-        }
-        return Collections.emptyMap();
-    }
-
-    private Map<Integer, ItemMappingData> parseItemMapping(String json) {
-        Map<Integer, ItemMappingData> result = new HashMap<>();
-        try {
-            JsonParser parser = new JsonParser();
-            JsonArray array = parser.parse(json).getAsJsonArray();
-            for (int i = 0; i < array.size(); i++) {
-                JsonObject obj = array.get(i).getAsJsonObject();
-                int id = obj.get("id").getAsInt();
-                String name = obj.has("name") ? obj.get("name").getAsString() : "Unknown";
-                String examine = obj.has("examine") ? obj.get("examine").getAsString() : "";
-                boolean members = obj.has("members") && obj.get("members").getAsBoolean();
-                int limit = obj.has("limit") ? obj.get("limit").getAsInt() : 0;
-                int value = obj.has("value") ? obj.get("value").getAsInt() : 0;
-                int lowAlch = obj.has("lowalch") ? obj.get("lowalch").getAsInt() : 0;
-                int highAlch = obj.has("highalch") ? obj.get("highalch").getAsInt() : 0;
-                String icon = obj.has("icon") ? obj.get("icon").getAsString() : "";
-                result.put(id, new ItemMappingData(id, name, examine, members, limit, value, lowAlch, highAlch, icon));
-            }
-        } catch (Exception ex) {
-            log.error("[GEFlipper] Failed to parse item mapping: ", ex);
-        }
-        return result;
-    }
-
-    private Map<Integer, int[]> fetchLatestPrices() {
-        Map<Integer, int[]> result = new HashMap<>();
-        try {
-            HttpRequest request = HttpRequest.newBuilder()
-                .uri(java.net.URI.create(WIKI_LATEST_URL))
-                .header("User-Agent", API_USER_AGENT)
-                .GET()
-                .build();
-            HttpResponse<String> response = HTTP_CLIENT.send(request, HttpResponse.BodyHandlers.ofString());
-            if (response.statusCode() == 200) {
-                JsonParser parser = new JsonParser();
-                JsonObject root = parser.parse(response.body()).getAsJsonObject();
-                JsonObject data = root.has("data") ? root.getAsJsonObject("data") : root;
-                for (Map.Entry<String, JsonElement> entry : data.entrySet()) {
-                    try {
-                        int itemId = Integer.parseInt(entry.getKey());
-                        JsonObject priceObj = entry.getValue().getAsJsonObject();
-                        int high = priceObj.has("high") && !priceObj.get("high").isJsonNull()
-                            ? priceObj.get("high").getAsInt() : 0;
-                        int low = priceObj.has("low") && !priceObj.get("low").isJsonNull()
-                            ? priceObj.get("low").getAsInt() : 0;
-                        result.put(itemId, new int[]{high, low});
-                    } catch (NumberFormatException e) {
-                        // skip
-                    }
-                }
-            }
-        } catch (Exception ex) {
-            log.error("[GEFlipper] Failed to fetch latest prices: ", ex);
-        }
-        return result;
-    }
-
-    private TimeSeriesAnalysis getTimeSeriesAnalysis(int itemId) {
-        try {
-            String url = String.format("%s?id=%d&timestep=5m", WIKI_TIMESERIES_URL, itemId);
-            HttpRequest request = HttpRequest.newBuilder()
-                .uri(java.net.URI.create(url))
-                .header("User-Agent", API_USER_AGENT)
-                .GET()
-                .build();
-            HttpResponse<String> response = HTTP_CLIENT.send(request, HttpResponse.BodyHandlers.ofString());
-            if (response.statusCode() == 200) {
-                JsonParser parser = new JsonParser();
-                JsonObject root = parser.parse(response.body()).getAsJsonObject();
-                JsonArray data = root.has("data") ? root.getAsJsonArray("data") : null;
-                if (data == null || data.size() == 0) return null;
-
-                List<TimeSeriesDataPoint> points = new ArrayList<>();
-                for (int i = 0; i < data.size(); i++) {
-                    JsonObject dp = data.get(i).getAsJsonObject();
-                    long timestamp = dp.has("timestamp") ? dp.get("timestamp").getAsLong() : 0;
-                    int avgHigh = dp.has("avgHighPrice") && !dp.get("avgHighPrice").isJsonNull()
-                        ? dp.get("avgHighPrice").getAsInt() : 0;
-                    int avgLow = dp.has("avgLowPrice") && !dp.get("avgLowPrice").isJsonNull()
-                        ? dp.get("avgLowPrice").getAsInt() : 0;
-                    int highVol = dp.has("highPriceVolume") && !dp.get("highPriceVolume").isJsonNull()
-                        ? dp.get("highPriceVolume").getAsInt() : 0;
-                    int lowVol = dp.has("lowPriceVolume") && !dp.get("lowPriceVolume").isJsonNull()
-                        ? dp.get("lowPriceVolume").getAsInt() : 0;
-                    points.add(new TimeSeriesDataPoint(timestamp, avgHigh, avgLow, highVol, lowVol));
-                }
-                return new TimeSeriesAnalysis(points, TimeSeriesInterval.FIVE_MINUTES);
-            }
-        } catch (Exception ex) {
-            log.error("[GEFlipper] Failed to fetch timeseries for item {}: ", itemId, ex);
-        }
-        return null;
-    }
-
-    // ========================================
-    // FILTERS & HELPERS
-    // ========================================
-
-    private boolean shouldConsiderItem(ItemMappingData metadata, Set<String> blacklist) {
-        if (blacklist.contains(metadata.name.toLowerCase())) return false;
-        if (metadata.members && !config.includeMembersItems()) return false;
-        if (config.maxTradeLimit() > 0 && metadata.tradeLimitPer4Hours > config.maxTradeLimit()) return false;
+    private boolean shouldConsiderItem(ItemMappingData meta, Set<String> blacklist) {
+        if (blacklist.contains(meta.name.toLowerCase())) return false;
+        if (meta.members && !config.includeMembersItems()) return false;
+        if (config.maxTradeLimit() > 0 && meta.tradeLimitPer4Hours > config.maxTradeLimit()) return false;
         return true;
     }
 
     private Set<String> parseBlacklist() {
-        String blacklistStr = config.itemBlacklist();
-        if (blacklistStr == null || blacklistStr.trim().isEmpty()) return Collections.emptySet();
-        return Arrays.stream(blacklistStr.split(","))
-            .map(String::trim)
-            .map(String::toLowerCase)
-            .filter(s -> !s.isEmpty())
-            .collect(Collectors.toSet());
+        return parseCommaSeparated(config.itemBlacklist());
     }
 
-    // ========================================
-    // STATUS & STATS
-    // ========================================
+    private Set<String> parseCustomList() {
+        return parseCommaSeparated(config.customItemList());
+    }
+
+    private static Set<String> parseCommaSeparated(String input) {
+        if (input == null || input.trim().isEmpty()) return Collections.emptySet();
+        return Arrays.stream(input.split(","))
+                .map(String::trim)
+                .map(String::toLowerCase)
+                .filter(s -> !s.isEmpty())
+                .collect(Collectors.toSet());
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // STATUS & PUBLIC ACCESSORS (for overlay)
+    // ════════════════════════════════════════════════════════════════════════
 
     private void updateStatus() {
-        Microbot.status = String.format("GE Flipper: %d active, %d done, %s gp",
-            activeFlips.size(), sessionFlipsCompleted, fmt(sessionTotalProfit));
+        Microbot.status = String.format("GE Flipper [%s]: %d active | %d done | %s gp",
+                config.flipMode(), activeFlips.size(), sessionFlipsCompleted, fmt(sessionTotalProfit));
     }
 
     public List<FlipAnalysis> getAnalyzedItems() {
@@ -988,24 +888,14 @@ public class GeFlipperScript extends Script {
     }
 
     public Map<String, Object> getSessionStats() {
-        Map<String, Object> stats = new HashMap<>();
-        stats.put("sessionProfit", sessionTotalProfit);
-        stats.put("flipsCompleted", sessionFlipsCompleted);
-        stats.put("activeFlips", activeFlips.size());
-        stats.put("elapsedMinutes", (System.currentTimeMillis() - sessionStartTime) / 60000);
+        Map<String, Object> stats = new LinkedHashMap<>();
+        stats.put("sessionProfit",        sessionTotalProfit);
+        stats.put("flipsCompleted",       sessionFlipsCompleted);
+        stats.put("activeFlips",          activeFlips.size());
+        stats.put("elapsedMinutes",       (System.currentTimeMillis() - sessionStartTime) / 60_000L);
         stats.put("analyzedOpportunities", analyzedItems.size());
-        stats.put("inventoryGP", inventoryGP);
+        stats.put("inventoryGP",          inventoryGP);
+        stats.put("flipMode",             config.flipMode().toString());
         return stats;
-    }
-
-    @Override
-    public void shutdown() {
-        super.shutdown();
-        activeFlips.clear();
-        analyzedItems.clear();
-        cachedItemMapping.clear();
-        cachedLatestPrices.clear();
-        log.info("[GEFlipper] Script shut down. Final profit: {} gp from {} flips",
-            fmt(sessionTotalProfit), sessionFlipsCompleted);
     }
 }
